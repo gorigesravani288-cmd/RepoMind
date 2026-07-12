@@ -52,7 +52,8 @@ with st.sidebar:
         st.info(f"Currently indexed:\n{st.session_state['indexed_repo']}")
 
     st.header("2. API key")
-    groq_key = os.getenv("GROQ_API_KEY") or st.text_input("GROQ_API_KEY", type="password")
+    groq_key = st.secrets.get("GROQ_API_KEY", None) if hasattr(st, "secrets") else None
+groq_key = groq_key or os.getenv("GROQ_API_KEY") or st.text_input("GROQ_API_KEY", type="password")
 
 # ---------- Helpers ----------
 @st.cache_resource

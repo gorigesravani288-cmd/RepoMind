@@ -23,6 +23,8 @@ INCLUDE_EXTENSIONS = {
     ".h", ".hpp", ".md", ".txt", ".json", ".yaml", ".yml", ".rs", ".php",
 }
 SKIP_DIRS = {".git", "node_modules", "__pycache__", "venv", ".venv", "dist", "build"}
+# Common extension-less files worth indexing (case-insensitive match on filename)
+INCLUDE_FILENAMES = {"readme", "license", "contributing", "changelog", "makefile", "dockerfile"}
 
 CHUNK_LINES = 60      # lines per chunk
 CHUNK_OVERLAP = 10    # overlapping lines between consecutive chunks
@@ -36,13 +38,19 @@ def clone_repo(repo_url: str, dest: str) -> None:
 
 
 def collect_chunks(repo_dir: str):
-    """Walk the repo and split eligible files into overlapping line-based chunks."""
+    """Walk the repo and split eligible files into overlapping line-based chunks.
+    Also returns a stats dict: {"files": {ext_or_name: count}, "total_files": N}
+    """
     chunks = []
+    file_stats = {}
+    indexed_files = set()
+
     for root, dirs, files in os.walk(repo_dir):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for fname in files:
             ext = os.path.splitext(fname)[1]
-            if ext not in INCLUDE_EXTENSIONS:
+            name_no_ext = os.path.splitext(fname)[0].lower()
+            if ext not in INCLUDE_EXTENSIONS and name_no_ext not in INCLUDE_FILENAMES:
                 continue
             fpath = os.path.join(root, fname)
             rel_path = os.path.relpath(fpath, repo_dir)
@@ -51,6 +59,10 @@ def collect_chunks(repo_dir: str):
                     lines = f.readlines()
             except Exception:
                 continue
+
+            label = ext if ext else name_no_ext
+            file_stats[label] = file_stats.get(label, 0) + 1
+            indexed_files.add(rel_path)
 
             step = CHUNK_LINES - CHUNK_OVERLAP
             for start in range(0, len(lines), step):
@@ -63,7 +75,9 @@ def collect_chunks(repo_dir: str):
                     "file": rel_path,
                     "start_line": start + 1,
                 })
-    return chunks
+
+    stats = {"files": file_stats, "total_files": len(indexed_files)}
+    return chunks, stats
 
 
 def embed_and_store(chunks, repo_url: str):
@@ -99,11 +113,11 @@ def ingest_repo(repo_url: str):
     tmp_dir = tempfile.mkdtemp()
     try:
         clone_repo(repo_url, tmp_dir)
-        chunks = collect_chunks(tmp_dir)
+        chunks, stats = collect_chunks(tmp_dir)
         if not chunks:
             raise ValueError("No indexable files found in this repo.")
         embed_and_store(chunks, repo_url)
-        return len(chunks)
+        return len(chunks), stats
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -113,4 +127,5 @@ if __name__ == "__main__":
     if len(sys.argv) != 2:
         print("Usage: python ingest.py <github_repo_url>")
         sys.exit(1)
-    ingest_repo(sys.argv[1])
+    n, stats = ingest_repo(sys.argv[1])
+    print(f"Indexed {n} chunks across {stats['total_files']} files: {stats['files']}")

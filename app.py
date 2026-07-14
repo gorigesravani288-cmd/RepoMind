@@ -100,6 +100,42 @@ def retrieve(query: str, k: int = 5):
     return hits
 
 
+def rewrite_query(question: str, history, api_key: str) -> str:
+    """Turn a follow-up question like 'can you show an example?' into a
+    fully self-contained search query using recent conversation history.
+    This runs BEFORE retrieval so the right code chunks get pulled."""
+    if not history:
+        return question
+
+    recent = history[-4:]
+    history_str = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in recent)
+
+    prompt = f"""Given this recent conversation and a new follow-up question, rewrite the
+follow-up into a single, fully self-contained search query that includes the missing
+context (e.g. replace "it"/"that"/"this" with the actual topic). Output ONLY the rewritten
+query, nothing else.
+
+Conversation:
+{history_str}
+
+Follow-up question: {question}
+
+Rewritten standalone query:"""
+
+    try:
+        client = Groq(api_key=api_key)
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",  # small/fast model is enough for this simple task
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=100,
+        )
+        rewritten = response.choices[0].message.content.strip().strip('"')
+        return rewritten if rewritten else question
+    except Exception:
+        return question  # fall back to original question if rewriting fails
+
+
 def get_groq_key():
     """Check Streamlit Cloud secrets first, then local .env, then manual sidebar input."""
     key = st.secrets.get("GROQ_API_KEY", None) if hasattr(st, "secrets") else None
@@ -225,6 +261,27 @@ with st.sidebar:
             st.session_state["messages"] = []
             st.rerun()
 
+        if st.session_state.get("messages"):
+            transcript_lines = [f"RepoMind conversation — {st.session_state['indexed_repo']}", "=" * 50, ""]
+            if st.session_state.get("repo_summary"):
+                transcript_lines += ["Repo Summary:", st.session_state["repo_summary"], "", "-" * 50, ""]
+            for m in st.session_state["messages"]:
+                role_label = "You" if m["role"] == "user" else "RepoMind"
+                transcript_lines.append(f"{role_label}: {m['content']}")
+                if m.get("sources"):
+                    srcs = ", ".join(f"{s['file']}:{s['start_line']}" for s in m["sources"])
+                    transcript_lines.append(f"  Sources: {srcs}")
+                transcript_lines.append("")
+            transcript_text = "\n".join(transcript_lines)
+
+            st.download_button(
+                "💾  Download conversation",
+                data=transcript_text,
+                file_name=f"repomind_{st.session_state['indexed_repo'].split('/')[-1]}.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
+
     st.markdown("---")
     st.caption("Built with Streamlit · ChromaDB · Groq · Sentence-Transformers")
 
@@ -282,8 +339,10 @@ if question:
 
         with st.chat_message("assistant", avatar="🧠"):
             with st.spinner("Retrieving context and generating answer..."):
-                hits = retrieve(question)
-                answer = ask_llm(question, hits, groq_key, history=st.session_state["messages"][:-1])
+                history_so_far = st.session_state["messages"][:-1]
+                search_query = rewrite_query(question, history_so_far, groq_key)
+                hits = retrieve(search_query)
+                answer = ask_llm(question, hits, groq_key, history=history_so_far)
                 st.markdown(answer)
                 chips = "".join(
                     f'<span class="rm-source-chip">{h["file"]}:{h["start_line"]}</span>' for h in hits

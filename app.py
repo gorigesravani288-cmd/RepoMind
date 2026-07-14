@@ -68,11 +68,20 @@ st.markdown("""
         border-radius: 6px; padding: 0.8rem 1rem; margin: 0.8rem 0 1.2rem 0; font-size: 0.9rem;
     }
     footer {visibility: hidden;}
-    /* Hide Streamlit Cloud's auto-added GitHub/viewer badge (top-right corner) */
-    #GithubIcon, .stAppDeployButton, [data-testid="stDecoration"],
-    .viewerBadge_container__1QSob, .viewerBadge_link__1S137 {
-        visibility: hidden !important;
-        display: none !important;
+    /* Hide Streamlit Cloud's top-right toolbar (Fork / GitHub / menu) for all visitors */
+    div[data-testid="stToolbar"] {
+        visibility: hidden;
+        height: 0%;
+        position: fixed;
+    }
+    div[data-testid="stDecoration"] {
+        visibility: hidden;
+        height: 0%;
+        position: fixed;
+    }
+    #MainMenu {
+        visibility: hidden;
+        height: 0%;
     }
 </style>
 """, unsafe_allow_html=True)

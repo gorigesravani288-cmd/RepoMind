@@ -22,7 +22,10 @@ INCLUDE_EXTENSIONS = {
     ".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rb", ".c", ".cpp",
     ".h", ".hpp", ".md", ".txt", ".json", ".yaml", ".yml", ".rs", ".php",
 }
-SKIP_DIRS = {".git", "node_modules", "__pycache__", "venv", ".venv", "dist", "build"}
+SKIP_DIRS = {
+    ".git", ".github", ".vscode", ".idea", "node_modules",
+    "__pycache__", "venv", ".venv", "dist", "build",
+}
 # Common extension-less files worth indexing (case-insensitive match on filename)
 INCLUDE_FILENAMES = {"readme", "license", "contributing", "changelog", "makefile", "dockerfile"}
 

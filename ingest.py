@@ -11,6 +11,7 @@ OUTPUT: a persistent ChromaDB store at ./chroma_db containing the
 """
 
 import os
+import ast
 import shutil
 import tempfile
 import git
@@ -40,6 +41,59 @@ def clone_repo(repo_url: str, dest: str) -> None:
     git.Repo.clone_from(repo_url, dest, depth=1)
 
 
+def chunk_python_by_ast(source_text: str):
+    """
+    Split Python source into chunks along function/class boundaries instead of
+    raw line counts, so each chunk is a complete, meaningful unit of code
+    (never cuts a function in half). Falls back to None if the file has a
+    syntax error or no top-level defs, so the caller can use line-based chunking.
+    """
+    try:
+        tree = ast.parse(source_text)
+    except SyntaxError:
+        return None
+
+    lines = source_text.splitlines()
+    chunks = []
+    covered_lines = set()
+
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            start = node.lineno
+            end = getattr(node, "end_lineno", start)
+            segment_lines = lines[start - 1:end]
+            segment = "\n".join(segment_lines).strip()
+            if not segment:
+                continue
+
+            # If a single function/class is huge, sub-split it so embeddings
+            # stay focused (very large classes would otherwise dilute the vector).
+            if len(segment_lines) > CHUNK_LINES:
+                step = CHUNK_LINES - CHUNK_OVERLAP
+                for sub_start in range(0, len(segment_lines), step):
+                    sub_lines = segment_lines[sub_start:sub_start + CHUNK_LINES]
+                    sub_text = "\n".join(sub_lines).strip()
+                    if sub_text:
+                        chunks.append({"text": sub_text, "start_line": start + sub_start})
+            else:
+                chunks.append({"text": segment, "start_line": start})
+
+            covered_lines.update(range(start, end + 1))
+
+    # Capture top-level code not inside any function/class (imports, constants,
+    # module-level logic) as its own chunk so nothing gets lost.
+    leftover_lines = [
+        (i + 1, line) for i, line in enumerate(lines)
+        if (i + 1) not in covered_lines and line.strip()
+    ]
+    if leftover_lines:
+        leftover_text = "\n".join(l for _, l in leftover_lines).strip()
+        if leftover_text:
+            chunks.append({"text": leftover_text, "start_line": leftover_lines[0][0]})
+
+    return chunks if chunks else None
+
+
 def collect_chunks(repo_dir: str):
     """Walk the repo and split eligible files into overlapping line-based chunks.
     Also returns a stats dict: {"files": {ext_or_name: count}, "total_files": N}
@@ -67,17 +121,27 @@ def collect_chunks(repo_dir: str):
             file_stats[label] = file_stats.get(label, 0) + 1
             indexed_files.add(rel_path)
 
-            step = CHUNK_LINES - CHUNK_OVERLAP
-            for start in range(0, len(lines), step):
-                chunk_lines = lines[start:start + CHUNK_LINES]
-                text = "".join(chunk_lines).strip()
-                if not text:
-                    continue
-                chunks.append({
-                    "text": text,
-                    "file": rel_path,
-                    "start_line": start + 1,
-                })
+            file_text = "".join(lines)
+            file_chunks = None
+            if ext == ".py":
+                file_chunks = chunk_python_by_ast(file_text)
+
+            if file_chunks is not None:
+                for c in file_chunks:
+                    chunks.append({"text": c["text"], "file": rel_path, "start_line": c["start_line"]})
+            else:
+                # Line-based fallback (non-Python files, or Python with a syntax error)
+                step = CHUNK_LINES - CHUNK_OVERLAP
+                for start in range(0, len(lines), step):
+                    chunk_lines = lines[start:start + CHUNK_LINES]
+                    text = "".join(chunk_lines).strip()
+                    if not text:
+                        continue
+                    chunks.append({
+                        "text": text,
+                        "file": rel_path,
+                        "start_line": start + 1,
+                    })
 
     stats = {"files": file_stats, "total_files": len(indexed_files)}
     return chunks, stats

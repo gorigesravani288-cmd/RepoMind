@@ -193,6 +193,6 @@ infrastructure.
 
 <div align="center">
 
-Built with 🧠 by [Your Name](https://github.com/<your-username>)
+Built with 🧠 by [Gorige Sravani](https://github.com/<your-username>)
 
 </div>

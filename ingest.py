@@ -26,12 +26,22 @@ INCLUDE_EXTENSIONS = {
 SKIP_DIRS = {
     ".git", ".github", ".vscode", ".idea", "node_modules",
     "__pycache__", "venv", ".venv", "dist", "build",
+    "vendor", "vendors", "third_party", "coverage", ".pytest_cache",
+    ".mypy_cache", ".tox", "site-packages", "target", "out",
 }
+# Generated/lock files that are huge, machine-written, and never useful to search.
+SKIP_FILENAMES = {
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
+    "pipfile.lock", "cargo.lock", "gemfile.lock", "composer.lock",
+}
+SKIP_FILE_SUFFIXES = (".min.js", ".min.css", ".map")
 # Common extension-less files worth indexing (case-insensitive match on filename)
 INCLUDE_FILENAMES = {"readme", "license", "contributing", "changelog", "makefile", "dockerfile"}
 
 CHUNK_LINES = 60      # lines per chunk
 CHUNK_OVERLAP = 10    # overlapping lines between consecutive chunks
+MAX_FILE_LINES = 3000   # skip pathologically huge single files (usually generated/data)
+MAX_TOTAL_CHUNKS = 1500  # cap total chunks so free-tier CPU embedding stays fast on huge repos
 DB_PATH = "./chroma_db"
 COLLECTION_NAME = "repo_chunks"
 
@@ -96,15 +106,26 @@ def chunk_python_by_ast(source_text: str):
 
 def collect_chunks(repo_dir: str):
     """Walk the repo and split eligible files into overlapping line-based chunks.
-    Also returns a stats dict: {"files": {ext_or_name: count}, "total_files": N}
+    Also returns a stats dict: {"files": {ext_or_name: count}, "total_files": N,
+    "truncated": bool} — truncated is True if MAX_TOTAL_CHUNKS was hit on a very
+    large repo, so the app can inform the user rather than silently cutting off.
     """
     chunks = []
     file_stats = {}
     indexed_files = set()
+    truncated = False
 
     for root, dirs, files in os.walk(repo_dir):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for fname in files:
+            if len(chunks) >= MAX_TOTAL_CHUNKS:
+                truncated = True
+                break
+
+            fname_lower = fname.lower()
+            if fname_lower in SKIP_FILENAMES or fname_lower.endswith(SKIP_FILE_SUFFIXES):
+                continue
+
             ext = os.path.splitext(fname)[1]
             name_no_ext = os.path.splitext(fname)[0].lower()
             if ext not in INCLUDE_EXTENSIONS and name_no_ext not in INCLUDE_FILENAMES:
@@ -116,6 +137,9 @@ def collect_chunks(repo_dir: str):
                     lines = f.readlines()
             except Exception:
                 continue
+
+            if len(lines) > MAX_FILE_LINES:
+                continue  # skip pathologically huge single files (usually generated/data dumps)
 
             label = ext if ext else name_no_ext
             file_stats[label] = file_stats.get(label, 0) + 1
@@ -142,8 +166,10 @@ def collect_chunks(repo_dir: str):
                         "file": rel_path,
                         "start_line": start + 1,
                     })
+        if truncated:
+            break
 
-    stats = {"files": file_stats, "total_files": len(indexed_files)}
+    stats = {"files": file_stats, "total_files": len(indexed_files), "truncated": truncated}
     return chunks, stats
 
 

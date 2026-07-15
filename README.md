@@ -1,8 +1,22 @@
 <div align="center">
 
-🧠 RepoMind
+# 🧠 RepoMind
 
-Ask questions about any public GitHub repository in plain English.
+**Ask any public GitHub repository questions in plain English — and get answers grounded in the actual source code.**
+
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
+[![Streamlit](https://img.shields.io/badge/built%20with-Streamlit-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
+[![ChromaDB](https://img.shields.io/badge/vector%20store-ChromaDB-6E56CF)](https://www.trychroma.com/)
+[![Groq](https://img.shields.io/badge/LLM-Groq%20(free%20tier)-F55036)](https://groq.com/)
+[![License](https://img.shields.io/badge/license-MIT-green)](#license)
+
+[Features](#-features) • [How it works](#-how-it-works) • [Quickstart](#-quickstart) • [Usage](#-usage) • [Deployment](#-deployment) • [Roadmap](#-roadmap)
+
+</div>
+
+---
+
+## Overview
 
 **RepoMind** is a Retrieval-Augmented Generation (RAG) chatbot for codebases. Point it at
 any public GitHub repository and it clones the code, intelligently chunks it, embeds it
@@ -35,27 +49,15 @@ for generation — no paid API keys, no cloud vector DB, no GPU required.
 
 ## 🏗 How it works
 
-```
-GitHub URL
-    │
-    ▼
-①  Clone            shallow clone of the target repo
-    │
-    ▼
-②  Chunk            Python → AST-based split (function/class boundaries)
-    │                other files → overlapping ~60-line chunks
-    ▼
-③  Embed            all-MiniLM-L6-v2 (local, no API calls)
-    │
-    ▼
-④  Store            persisted in a local ChromaDB collection
-    │
-    ▼
-⑤  Retrieve         question → rewritten with chat history → embedded → top-k chunks
-    │
-    ▼
-⑥  Generate         chunks + question + history → Groq LLM → cited, grounded answer
-```
+1. **Clone** — shallow clone of the target repo from the GitHub URL you provide.
+2. **Chunk** — Python files are split by AST along function/class boundaries; all
+   other supported files are split into overlapping ~60-line chunks.
+3. **Embed** — each chunk is embedded locally with `all-MiniLM-L6-v2` (no API calls).
+4. **Store** — embeddings are persisted in a local ChromaDB collection.
+5. **Retrieve** — your question is rewritten using recent chat history, embedded, and
+   used to pull the top-k most relevant chunks.
+6. **Generate** — those chunks, your question, and the conversation history are sent
+   to a Groq LLM, which returns a cited, grounded answer.
 
 ---
 
@@ -111,14 +113,13 @@ python ingest.py https://github.com/user/repo
 
 ---
 
-📁 Project Structure
+## 📁 Project Structure
 
-RepoMind/
-├── app.py             # Streamlit chat UI — retrieval, generation, conversation state
-├── ingest.py           # Clone → chunk (AST-aware) → embed → store pipeline
-├── requirements.txt
-├── .env.example
-└── README.md
+- **`app.py`** — Streamlit chat UI: retrieval, generation, conversation state
+- **`ingest.py`** — Clone → chunk (AST-aware) → embed → store pipeline
+- **`requirements.txt`** — Python dependencies
+- **`.env.example`** — template for your `GROQ_API_KEY`
+- **`README.md`** — this file
 
 ---
 

@@ -111,15 +111,14 @@ python ingest.py https://github.com/user/repo
 
 ---
 
-## 📁 Project Structure
-```
+📁 Project Structure
+
 RepoMind/
 ├── app.py             # Streamlit chat UI — retrieval, generation, conversation state
 ├── ingest.py           # Clone → chunk (AST-aware) → embed → store pipeline
 ├── requirements.txt
 ├── .env.example
 └── README.md
-```
 
 ---
 

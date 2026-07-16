@@ -23,6 +23,8 @@ from dotenv import load_dotenv
 import chromadb
 from sentence_transformers import SentenceTransformer
 from groq import Groq
+import streamlit.components.v1 as components
+from diagram import build_repo_module_graph, trim_to_most_connected, graph_to_mermaid, render_mermaid
 
 from ingest import ingest_repo, DB_PATH, COLLECTION_NAME
 
@@ -135,9 +137,20 @@ Rewritten standalone query:"""
         return question
 
 
+def _safe_get_secret(key: str):
+    """Reads st.secrets safely. Streamlit Cloud always has a secrets store,
+    but locally (no secrets.toml file) accessing st.secrets.get() raises
+    StreamlitSecretNotFoundError instead of just returning None. This wraps
+    that so local development never crashes -- it just falls back to .env."""
+    try:
+        return st.secrets.get(key, None)
+    except Exception:
+        return None
+
+
 def get_groq_key():
     """Check Streamlit Cloud secrets first, then local .env, then manual sidebar input."""
-    key = st.secrets.get("GROQ_API_KEY", None) if hasattr(st, "secrets") else None
+    key = _safe_get_secret("GROQ_API_KEY")
     key = key or os.getenv("GROQ_API_KEY")
     if not key:
         key = st.session_state.get("manual_groq_key", "")
@@ -208,14 +221,9 @@ Summary:"""
 # Sidebar: index a repo + settings
 # ---------------------------------------------------------------------------
 with st.sidebar:
-    st.markdown('<div class="rm-step-label">Step 1 · API key</div>', unsafe_allow_html=True)
-    _preloaded_key = (st.secrets.get("GROQ_API_KEY", None) if hasattr(st, "secrets") else None) or os.getenv("GROQ_API_KEY")
-    if _preloaded_key:
-        st.markdown("🔑 Key loaded from secrets ✅")
-    else:
-        st.text_input("GROQ_API_KEY", type="password", placeholder="gsk_...", key="manual_groq_key")
+    _preloaded_key = _safe_get_secret("GROQ_API_KEY") or os.getenv("GROQ_API_KEY")
 
-    st.markdown('<div class="rm-step-label">Step 2 · Index a repo</div>', unsafe_allow_html=True)
+    st.markdown('<div class="rm-step-label">Step 1 · Index a repo</div>', unsafe_allow_html=True)
     repo_url = st.text_input(
         "GitHub repo URL", placeholder="https://github.com/user/repo", label_visibility="collapsed",
     )
@@ -292,6 +300,14 @@ with st.sidebar:
             )
 
     st.markdown("---")
+
+    if _preloaded_key:
+        st.caption("🔑 API key loaded ✅")
+    else:
+        with st.expander("🔑 Add API key (needed for Q&A, not for indexing/diagrams)"):
+            st.text_input("GROQ_API_KEY", type="password", placeholder="gsk_...", key="manual_groq_key")
+            st.caption("Get a free key at console.groq.com/keys")
+
     st.caption("Built with Streamlit · ChromaDB · Groq · Sentence-Transformers")
 
 groq_key = get_groq_key()
@@ -318,6 +334,19 @@ else:
         )
     if not st.session_state["messages"]:
         st.info(f"💬 Ready! Ask anything about **{st.session_state['indexed_repo'].split('/')[-1]}**.")
+        st.markdown('<div class="rm-step-label" style="margin-top:0.5rem;">Try asking</div>', unsafe_allow_html=True)
+        example_questions = [
+            "What does this project do?",
+            "Show me the main entry point",
+            "Diagram the architecture",
+            "What are the main dependencies?",
+        ]
+        cols = st.columns(len(example_questions))
+        for col, ex_q in zip(cols, example_questions):
+            with col:
+                if st.button(ex_q, key=f"example_{ex_q}", use_container_width=True):
+                    st.session_state["pending_question"] = ex_q
+                    st.rerun()
 
 for msg in st.session_state["messages"]:
     avatar = "🙋" if msg["role"] == "user" else "🧠"
@@ -336,9 +365,46 @@ for msg in st.session_state["messages"]:
 
 question = st.chat_input("Ask something about the indexed repo...")
 
+if not question and st.session_state.get("pending_question"):
+    question = st.session_state.pop("pending_question")
+
 if question:
     if "indexed_repo" not in st.session_state:
         st.warning("Index a repo first using the sidebar.")
+    elif "architecture" in question.lower() or "diagram" in question.lower():
+        # Diagram requests are handled separately from the normal RAG flow --
+        # this needs no Groq API key at all, since it's pure local analysis
+        # of already-indexed chunk data.
+        st.session_state["messages"].append({"role": "user", "content": question, "sources": None})
+        with st.chat_message("user", avatar="🙋"):
+            st.markdown(question)
+
+        with st.chat_message("assistant", avatar="🧠"):
+            with st.spinner("Analyzing internal import relationships..."):
+                try:
+                    graph = build_repo_module_graph(DB_PATH, COLLECTION_NAME)
+                    graph, was_trimmed = trim_to_most_connected(graph, max_nodes=35)
+                    mermaid_code = graph_to_mermaid(graph)
+                except Exception:
+                    mermaid_code = ""
+                    was_trimmed = False
+
+            if mermaid_code:
+                notes = []
+                if was_trimmed:
+                    notes.append("showing the 35 most-connected files")
+                notes.append("examples/tests/docs excluded by default")
+                st.caption(f"📏 {' · '.join(notes)}.")
+                st.markdown("Here's how the modules in this repo depend on each other:")
+                render_mermaid(mermaid_code)
+                reply = "Generated a module dependency diagram above, based on internal imports between the repo's Python files."
+            else:
+                st.warning(
+                    "Couldn't find clear internal import relationships to diagram for this repo — "
+                    "it may not be a Python-heavy codebase, or its files may not import each other directly."
+                )
+                reply = "No diagram could be generated for this repo."
+        st.session_state["messages"].append({"role": "assistant", "content": reply, "sources": None})
     elif not groq_key:
         st.warning("Add your GROQ_API_KEY in the sidebar.")
     else:

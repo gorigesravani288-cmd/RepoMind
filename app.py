@@ -285,6 +285,9 @@ with st.sidebar:
             for m in st.session_state["messages"]:
                 role_label = "You" if m["role"] == "user" else "RepoMind"
                 transcript_lines.append(f"{role_label}: {m['content']}")
+                if m.get("mermaid"):
+                    transcript_lines.append("  [Diagram code -- paste into https://mermaid.live to view]")
+                    transcript_lines.append("  " + m["mermaid"].replace("\n", "\n  "))
                 if m.get("sources"):
                     srcs = ", ".join(f"{s['file']}:{s['start_line']}" for s in m["sources"])
                     transcript_lines.append(f"  Sources: {srcs}")
@@ -334,24 +337,15 @@ else:
         )
     if not st.session_state["messages"]:
         st.info(f"💬 Ready! Ask anything about **{st.session_state['indexed_repo'].split('/')[-1]}**.")
-        st.markdown('<div class="rm-step-label" style="margin-top:0.5rem;">Try asking</div>', unsafe_allow_html=True)
-        example_questions = [
-            "What does this project do?",
-            "Show me the main entry point",
-            "Diagram the architecture",
-            "What are the main dependencies?",
-        ]
-        cols = st.columns(len(example_questions))
-        for col, ex_q in zip(cols, example_questions):
-            with col:
-                if st.button(ex_q, key=f"example_{ex_q}", use_container_width=True):
-                    st.session_state["pending_question"] = ex_q
-                    st.rerun()
 
 for msg in st.session_state["messages"]:
     avatar = "🙋" if msg["role"] == "user" else "🧠"
     with st.chat_message(msg["role"], avatar=avatar):
         st.markdown(msg["content"])
+        if msg.get("mermaid"):
+            render_mermaid(msg["mermaid"])
+            with st.expander("View diagram code (paste into mermaid.live to view/edit)"):
+                st.code(msg["mermaid"], language="text")
         if msg.get("sources"):
             chips = "".join(
                 f'<span class="rm-source-chip">{s["file"]}:{s["start_line"]}</span>'
@@ -364,9 +358,6 @@ for msg in st.session_state["messages"]:
                     st.code(s["text"], language="python")
 
 question = st.chat_input("Ask something about the indexed repo...")
-
-if not question and st.session_state.get("pending_question"):
-    question = st.session_state.pop("pending_question")
 
 if question:
     if "indexed_repo" not in st.session_state:
@@ -397,6 +388,8 @@ if question:
                 st.caption(f"📏 {' · '.join(notes)}.")
                 st.markdown("Here's how the modules in this repo depend on each other:")
                 render_mermaid(mermaid_code)
+                with st.expander("View diagram code (paste into mermaid.live to view/edit)"):
+                    st.code(mermaid_code, language="text")
                 reply = "Generated a module dependency diagram above, based on internal imports between the repo's Python files."
             else:
                 st.warning(
@@ -404,7 +397,9 @@ if question:
                     "it may not be a Python-heavy codebase, or its files may not import each other directly."
                 )
                 reply = "No diagram could be generated for this repo."
-        st.session_state["messages"].append({"role": "assistant", "content": reply, "sources": None})
+        st.session_state["messages"].append(
+            {"role": "assistant", "content": reply, "sources": None, "mermaid": mermaid_code or None}
+        )
     elif not groq_key:
         st.warning("Add your GROQ_API_KEY in the sidebar.")
     else:

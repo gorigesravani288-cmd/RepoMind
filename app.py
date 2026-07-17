@@ -138,6 +138,57 @@ Rewritten standalone query:"""
         return question
 
 
+import re
+
+_CASUAL_PATTERNS = re.compile(
+    r"^(ok(ay)?|thanks?( you)?|thank you|cool|nice|great|got it|"
+    r"sounds good|awesome|perfect|sure|alright|yep|yes|no|k|kk|"
+    r"hi|hello|hey|good morning|good evening|bye|goodbye|"
+    r"lol|haha|nvm|never ?mind)[.!?]*$",
+    re.IGNORECASE,
+)
+
+
+def is_casual_message(text: str) -> bool:
+    """Detects short conversational filler (greetings, thanks, acknowledgments)
+    that isn't a real question about the repo. These should get a natural
+    reply instead of being run through retrieval, which would otherwise fail
+    and produce an unhelpful 'I didn't find that' response. Deliberately
+    conservative -- only matches short, common phrases, so a real short
+    question like "why?" still goes to retrieval as normal."""
+    cleaned = text.strip()
+    if len(cleaned.split()) > 4:
+        return False
+    return bool(_CASUAL_PATTERNS.match(cleaned))
+
+
+def casual_reply(question: str, api_key: str) -> str:
+    """Generates a short, natural reply to casual messages without touching
+    retrieval/ChromaDB at all. Falls back to a canned reply if no API key
+    is available, so this never hard-fails."""
+    if not api_key:
+        return "👍 Let me know if you'd like to ask anything else about the repo!"
+    try:
+        client = Groq(api_key=api_key)
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{
+                "role": "user",
+                "content": (
+                    f'The user said: "{question}" in a chat about a codebase. '
+                    "Reply naturally and briefly (1 sentence, friendly tone), "
+                    "as a normal conversational reply -- do not mention code, "
+                    "files, or retrieval."
+                ),
+            }],
+            temperature=0.5,
+            max_tokens=40,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception:
+        return "👍 Let me know if you'd like to ask anything else about the repo!"
+
+
 def _safe_get_secret(key: str):
     """Reads st.secrets safely. Streamlit Cloud always has a secrets store,
     but locally (no secrets.toml file) accessing st.secrets.get() raises
@@ -445,6 +496,14 @@ if question:
             {"role": "assistant", "content": reply, "sources": None,
              "mermaid": mermaid_code or None, "diagram_png_b64": diagram_png_b64}
         )
+    elif is_casual_message(question):
+        st.session_state["messages"].append({"role": "user", "content": question, "sources": None})
+        with st.chat_message("user", avatar="🙋"):
+            st.markdown(question)
+        with st.chat_message("assistant", avatar="🧠"):
+            reply = casual_reply(question, groq_key)
+            st.markdown(reply)
+        st.session_state["messages"].append({"role": "assistant", "content": reply, "sources": None})
     elif not groq_key:
         st.warning("Add your GROQ_API_KEY in the sidebar.")
     else:

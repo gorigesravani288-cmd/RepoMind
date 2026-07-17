@@ -189,6 +189,32 @@ def casual_reply(question: str, api_key: str) -> str:
         return "👍 Let me know if you'd like to ask anything else about the repo!"
 
 
+_HELP_PATTERNS = re.compile(
+    r"(what can (you|i) (do|ask)|help me|how does this work|"
+    r"what (are|is) (your|the) (features|capabilities)|what should i ask)",
+    re.IGNORECASE,
+)
+
+
+def is_help_question(text: str) -> bool:
+    """Detects meta-questions about what RepoMind can do, so they get a
+    direct capabilities summary instead of being run through code retrieval
+    (which would find nothing relevant and refuse)."""
+    return bool(_HELP_PATTERNS.search(text.strip()))
+
+
+def help_reply(repo_name: str) -> str:
+    return (
+        f"Happy to help! Here's what you can ask me about **{repo_name}**:\n\n"
+        "- **Factual questions** — \"What does `parse_config` do?\", \"Where is auth handled?\"\n"
+        "- **Open-ended analysis** — \"What are the pros and cons of this structure?\", "
+        "\"Any suggestions to improve this?\"\n"
+        "- **Architecture** — say \"diagram the architecture\" for a visual module map\n"
+        "- **Follow-ups** — I remember recent context, so \"can you show an example?\" works too\n\n"
+        "Just ask naturally — no special syntax needed!"
+    )
+
+
 def _safe_get_secret(key: str):
     """Reads st.secrets safely. Streamlit Cloud always has a secrets store,
     but locally (no secrets.toml file) accessing st.secrets.get() raises
@@ -218,16 +244,18 @@ def ask_llm(question: str, context_chunks, api_key: str, history=None) -> str:
         recent = history[-4:]
         history_str = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in recent)
 
-    prompt = f"""You are RepoMind, an assistant that answers questions about a codebase
-using ONLY the provided context.
+    prompt = f"""You are RepoMind, a friendly assistant that helps people understand and
+think through a codebase, grounded in the provided context.
 
 Rules:
 - Answer the question directly. Do NOT restate the question or describe what you're about to do.
 - Do NOT add filler commentary like "this indicates its importance" unless it's a genuine, specific insight backed by the context.
-- If the context has enough information, give a clear, specific, useful answer in 2-5 sentences.
-- If the context does NOT have enough information, say so in one honest sentence and suggest what to ask instead.
-- Always mention which file(s) your answer is based on, naturally in the sentence.
+- For factual questions (what does X do, where is Y defined), if the context has enough information, give a clear, specific answer in 2-5 sentences.
+- For open-ended questions (advantages/disadvantages, suggestions, improvements, opinions, "what do you think"), you are ENCOURAGED to reason about and analyze the retrieved code even if the answer isn't explicitly written out -- this is expected, not a failure. Use your general software engineering knowledge together with what's in the context to give a thoughtful, useful answer.
+- Only say you don't have enough information if the context is genuinely unrelated to the question (e.g. asking about a file/feature that doesn't exist in this repo at all). Never refuse an analysis or opinion question just because the answer wasn't spelled out verbatim.
+- Always mention which file(s) your answer is based on, naturally in the sentence, when your answer draws on specific code.
 - Use the recent conversation (if any) to resolve references like "it" or "that function".
+- Keep a warm, conversational tone -- this should feel like talking to a helpful teammate, not a search engine.
 
 Recent conversation:
 {history_str if history_str else "(none yet)"}
@@ -502,6 +530,15 @@ if question:
             st.markdown(question)
         with st.chat_message("assistant", avatar="🧠"):
             reply = casual_reply(question, groq_key)
+            st.markdown(reply)
+        st.session_state["messages"].append({"role": "assistant", "content": reply, "sources": None})
+    elif is_help_question(question):
+        st.session_state["messages"].append({"role": "user", "content": question, "sources": None})
+        with st.chat_message("user", avatar="🙋"):
+            st.markdown(question)
+        with st.chat_message("assistant", avatar="🧠"):
+            repo_name = st.session_state["indexed_repo"].split("/")[-1]
+            reply = help_reply(repo_name)
             st.markdown(reply)
         st.session_state["messages"].append({"role": "assistant", "content": reply, "sources": None})
     elif not groq_key:

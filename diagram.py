@@ -25,7 +25,34 @@ OUTPUT: a Mermaid diagram rendered inline in the Streamlit app
 
 import ast
 import re
+import base64
 import chromadb
+
+
+def mermaid_to_png_bytes(mermaid_code: str, timeout: int = 15):
+    """Renders Mermaid code to an actual PNG image server-side, using the
+    free public mermaid.ink rendering API. This is what makes a single
+    combined text+image download possible: the diagram in the app UI is
+    drawn by JavaScript in the browser, so Python never sees real image
+    bytes from that -- this fetches an independent, real render instead.
+
+    Returns PNG bytes, or None if the request fails for any reason (no
+    internet, service down, etc.) -- callers should fall back to offering
+    just the diagram's text/code instead of crashing."""
+    try:
+        import requests
+    except ImportError:
+        return None
+
+    try:
+        encoded = base64.urlsafe_b64encode(mermaid_code.encode("utf-8")).decode("ascii").rstrip("=")
+        url = f"https://mermaid.ink/img/{encoded}?type=png"
+        resp = requests.get(url, timeout=timeout)
+        if resp.status_code == 200 and resp.content:
+            return resp.content
+        return None
+    except Exception:
+        return None
 
 # Folders that are usually not "the architecture" -- tutorials, tests, docs.
 # Excluded by default to keep the diagram focused on core source code.
@@ -217,10 +244,93 @@ def graph_to_mermaid(graph: dict) -> str:
     return "\n".join(lines)
 
 
+def render_graph_to_png_bytes(graph: dict, group_fn=None) -> bytes:
+    """Renders the same dependency graph as a STATIC PNG image using pure
+    Python (matplotlib + networkx) -- no browser/JS involved. This exists
+    specifically so the diagram can be embedded into a downloadable file
+    (the live in-app view uses interactive Mermaid instead, which only
+    exists inside the browser and can't be captured server-side).
+
+    matplotlib + networkx are plain pip packages (no system binary install,
+    no PATH/permissions issues) -- unlike Graphviz, which needed a separate
+    system-level install this project deliberately avoided.
+
+    Returns PNG image bytes, or None if rendering fails for any reason
+    (e.g. libraries not installed) -- callers should treat None as
+    'skip the image, text export still works'."""
+    try:
+        import io
+        import matplotlib
+        matplotlib.use("Agg")  # headless backend -- no display needed, safe on a server
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        import networkx as nx
+    except ImportError:
+        return None
+
+    try:
+        if group_fn is None:
+            group_fn = _top_level_group
+
+        G = nx.DiGraph()
+        all_nodes = set(graph.keys())
+        for targets in graph.values():
+            all_nodes.update(targets)
+        for n in all_nodes:
+            G.add_node(n)
+        for f, targets in graph.items():
+            for t in targets:
+                G.add_edge(f, t)
+
+        if G.number_of_nodes() == 0:
+            return None
+
+        # Color nodes by their folder group, same idea as the Mermaid subgraphs.
+        groups = sorted({group_fn(n) for n in G.nodes})
+        palette = plt.cm.tab10.colors
+        group_color = {g: palette[i % len(palette)] for i, g in enumerate(groups)}
+        node_colors = [group_color[group_fn(n)] for n in G.nodes]
+        labels = {n: _short_label(n) for n in G.nodes}
+
+        fig_w = max(10, min(24, G.number_of_nodes() * 0.6))
+        fig_h = max(8, min(18, G.number_of_nodes() * 0.45))
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+        pos = nx.spring_layout(G, seed=42, k=1.3)
+        nx.draw_networkx_edges(G, pos, ax=ax, edge_color="#999999",
+                                arrows=True, arrowsize=14, width=1.2,
+                                connectionstyle="arc3,rad=0.05")
+        nx.draw_networkx_nodes(G, pos, ax=ax, node_color=node_colors,
+                                node_size=1600, edgecolors="#333333", linewidths=1)
+        nx.draw_networkx_labels(G, pos, labels=labels, ax=ax, font_size=8)
+
+        legend_handles = [mpatches.Patch(color=group_color[g], label=g) for g in groups]
+        ax.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(1.01, 1),
+                   fontsize=8, title="Folder")
+
+        ax.set_title("Repository Architecture -- Module Dependencies", fontsize=13)
+        ax.axis("off")
+        fig.tight_layout()
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
 def render_mermaid(mermaid_code: str, height: int = 550):
-    """Renders Mermaid code inline in Streamlit via an embedded HTML component.
-    Import is done lazily inside the function so this module can be imported
-    even in contexts without Streamlit available (e.g. quick local testing).
+    """Renders Mermaid code inline in Streamlit via an embedded HTML component,
+    for interactive viewing in the app. Import is done lazily inside the
+    function so this module can be imported even in contexts without
+    Streamlit available (e.g. quick local testing).
+
+    For actually saving/downloading the diagram, see mermaid_to_png_bytes()
+    above -- that generates a real image server-side for the combined
+    text+image download, since a browser-rendered SVG here has no bytes
+    that Python can access directly.
 
     useMaxWidth:false + an explicit scrollable wrapper is important: without
     it, Mermaid auto-scales large diagrams down to fit the container, which

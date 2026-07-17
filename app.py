@@ -18,13 +18,14 @@ EXECUTION:
 """
 
 import os
+import base64
 import streamlit as st
 from dotenv import load_dotenv
 import chromadb
 from sentence_transformers import SentenceTransformer
 from groq import Groq
 import streamlit.components.v1 as components
-from diagram import build_repo_module_graph, trim_to_most_connected, graph_to_mermaid, render_mermaid
+from diagram import build_repo_module_graph, trim_to_most_connected, graph_to_mermaid, render_mermaid, mermaid_to_png_bytes
 
 from ingest import ingest_repo, DB_PATH, COLLECTION_NAME
 
@@ -279,28 +280,65 @@ with st.sidebar:
             st.rerun()
 
         if st.session_state.get("messages"):
-            transcript_lines = [f"RepoMind conversation — {st.session_state['indexed_repo']}", "=" * 50, ""]
+            repo_name = st.session_state["indexed_repo"].split("/")[-1]
+
+            # Build ONE combined HTML file: readable text + real embedded
+            # images (as base64 data URIs) side by side, all in a single
+            # downloadable file that opens directly in any browser.
+            html_parts = [
+                "<html><head><meta charset='utf-8'>",
+                f"<title>RepoMind — {repo_name}</title>",
+                "<style>",
+                "body{font-family:-apple-system,Segoe UI,Arial,sans-serif;max-width:900px;",
+                "margin:40px auto;padding:0 20px;line-height:1.5;color:#1a1a1a;}",
+                "h1{font-size:1.4rem;} .msg{margin:18px 0;padding:14px 18px;border-radius:10px;}",
+                ".user{background:#eef2ff;} .assistant{background:#f7f7f8;}",
+                ".role{font-weight:700;font-size:0.8rem;text-transform:uppercase;",
+                "color:#666;margin-bottom:6px;}",
+                "img{max-width:100%;border:1px solid #ddd;border-radius:8px;margin-top:10px;}",
+                ".sources{font-size:0.8rem;color:#555;margin-top:8px;}",
+                "</style></head><body>",
+                f"<h1>🧠 RepoMind conversation — {repo_name}</h1>",
+            ]
             if st.session_state.get("repo_summary"):
-                transcript_lines += ["Repo Summary:", st.session_state["repo_summary"], "", "-" * 50, ""]
+                html_parts.append(f"<p><em>{st.session_state['repo_summary']}</em></p><hr>")
+
             for m in st.session_state["messages"]:
                 role_label = "You" if m["role"] == "user" else "RepoMind"
-                transcript_lines.append(f"{role_label}: {m['content']}")
-                if m.get("mermaid"):
-                    transcript_lines.append("  [Diagram code -- paste into https://mermaid.live to view]")
-                    transcript_lines.append("  " + m["mermaid"].replace("\n", "\n  "))
+                css_class = "user" if m["role"] == "user" else "assistant"
+                html_parts.append(f'<div class="msg {css_class}"><div class="role">{role_label}</div>')
+                html_parts.append(f"<div>{m['content']}</div>")
+
+                if m.get("diagram_png_b64"):
+                    html_parts.append(
+                        f'<img src="data:image/png;base64,{m["diagram_png_b64"]}" alt="Architecture diagram">'
+                    )
+                elif m.get("mermaid"):
+                    # Image render failed at generation time (e.g. no internet)
+                    # -- fall back to including the raw diagram code instead
+                    # of silently losing it.
+                    html_parts.append(
+                        "<p><em>Diagram image unavailable — paste this code into "
+                        '<a href="https://mermaid.live">mermaid.live</a> to view it:</em></p>'
+                        f"<pre>{m['mermaid']}</pre>"
+                    )
+
                 if m.get("sources"):
                     srcs = ", ".join(f"{s['file']}:{s['start_line']}" for s in m["sources"])
-                    transcript_lines.append(f"  Sources: {srcs}")
-                transcript_lines.append("")
-            transcript_text = "\n".join(transcript_lines)
+                    html_parts.append(f'<div class="sources">Sources: {srcs}</div>')
+                html_parts.append("</div>")
+
+            html_parts.append("</body></html>")
+            combined_html = "\n".join(html_parts)
 
             st.download_button(
-                "💾  Download conversation",
-                data=transcript_text,
-                file_name=f"repomind_{st.session_state['indexed_repo'].split('/')[-1]}.txt",
-                mime="text/plain",
+                "💾  Download conversation (text + diagrams)",
+                data=combined_html,
+                file_name=f"repomind_{repo_name}.html",
+                mime="text/html",
                 use_container_width=True,
             )
+            st.caption("Opens in any browser — includes both your Q&A and any diagram images together.")
 
     st.markdown("---")
 
@@ -391,14 +429,21 @@ if question:
                 with st.expander("View diagram code (paste into mermaid.live to view/edit)"):
                     st.code(mermaid_code, language="text")
                 reply = "Generated a module dependency diagram above, based on internal imports between the repo's Python files."
+
+                # Fetch a real PNG once now (not at download time) so the combined
+                # export button doesn't need to re-render on every click.
+                png_bytes = mermaid_to_png_bytes(mermaid_code)
+                diagram_png_b64 = base64.b64encode(png_bytes).decode("ascii") if png_bytes else None
             else:
                 st.warning(
                     "Couldn't find clear internal import relationships to diagram for this repo — "
                     "it may not be a Python-heavy codebase, or its files may not import each other directly."
                 )
                 reply = "No diagram could be generated for this repo."
+                diagram_png_b64 = None
         st.session_state["messages"].append(
-            {"role": "assistant", "content": reply, "sources": None, "mermaid": mermaid_code or None}
+            {"role": "assistant", "content": reply, "sources": None,
+             "mermaid": mermaid_code or None, "diagram_png_b64": diagram_png_b64}
         )
     elif not groq_key:
         st.warning("Add your GROQ_API_KEY in the sidebar.")

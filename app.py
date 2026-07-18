@@ -140,26 +140,44 @@ Rewritten standalone query:"""
 
 import re
 
-_CASUAL_PATTERNS = re.compile(
-    r"^(ok(ay)?|thanks?( you)?|thank you|cool|nice|great|got it|"
-    r"sounds good|awesome|perfect|sure|alright|yep|yes|no|k|kk|"
-    r"hi|hello|hey|good morning|good evening|bye|goodbye|"
-    r"lol|haha|nvm|never ?mind)[.!?]*$",
-    re.IGNORECASE,
-)
+# Vocabulary of casual/filler words and common slang abbreviations. A message
+# is treated as casual if EVERY word in it belongs to this set -- this is
+# what lets combinations like "ok tq" or "u r sweet" get caught, since it
+# doesn't rely on matching one exact pre-written phrase the way a fixed
+# regex list does.
+_CASUAL_WORDS = {
+    # thanks / acknowledgment
+    "ok", "okay", "kk", "k", "thanks", "thank", "thankyou", "thx", "tq", "ty",
+    "np", "welcome", "appreciate", "appreciated", "cool", "nice", "great",
+    "good", "awesome", "sweet", "perfect", "superb", "excellent", "amazing",
+    "wow", "sounds", "got", "it", "alright", "sure",
+    # yes/no/filler
+    "yes", "yep", "yeah", "yup", "no", "nope", "nah",
+    # greetings/farewell
+    "hi", "hello", "hey", "yo", "sup", "wassup", "bye", "goodbye", "morning",
+    "evening", "night",
+    # you / are (for "u r sweet", "you are great", etc.)
+    "u", "ur", "you", "youre", "r", "are", "so", "very", "much", "this",
+    # laughter / mood
+    "lol", "haha", "hehe", "lmao", "nvm", "nevermind", "never", "mind",
+    "love", "loved", "well", "done", "job", "one", "work", "lot", "a", "there",
+}
 
 
 def is_casual_message(text: str) -> bool:
-    """Detects short conversational filler (greetings, thanks, acknowledgments)
-    that isn't a real question about the repo. These should get a natural
-    reply instead of being run through retrieval, which would otherwise fail
-    and produce an unhelpful 'I didn't find that' response. Deliberately
-    conservative -- only matches short, common phrases, so a real short
-    question like "why?" still goes to retrieval as normal."""
-    cleaned = text.strip()
-    if len(cleaned.split()) > 4:
+    """Detects casual/conversational messages (thanks, compliments,
+    greetings, slang acknowledgments) so they get a natural reply instead
+    of being run through code retrieval, which would otherwise find nothing
+    relevant and produce an unhelpful, oddly-cited response. A message
+    counts as casual only if EVERY word in it is in the casual vocabulary
+    AND it's short (<=6 words) -- this keeps real short questions like
+    "why?" or "is this thread safe" going to retrieval as normal, since
+    "thread"/"safe"/"why" aren't in the casual vocabulary."""
+    cleaned = text.strip().lower()
+    words = re.findall(r"[a-z']+", cleaned)
+    if not words or len(words) > 6:
         return False
-    return bool(_CASUAL_PATTERNS.match(cleaned))
+    return all(w in _CASUAL_WORDS for w in words)
 
 
 def casual_reply(question: str, api_key: str) -> str:
@@ -176,7 +194,8 @@ def casual_reply(question: str, api_key: str) -> str:
                 "role": "user",
                 "content": (
                     f'The user said: "{question}" in a chat about a codebase. '
-                    "Reply naturally and briefly (1 sentence, friendly tone), "
+                    "Reply the way a warm, genuine friend would -- brief (1 sentence), "
+                    "casual, a little personality is welcome. "
                     "as a normal conversational reply -- do not mention code, "
                     "files, or retrieval."
                 ),
@@ -244,18 +263,33 @@ def ask_llm(question: str, context_chunks, api_key: str, history=None) -> str:
         recent = history[-4:]
         history_str = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in recent)
 
-    prompt = f"""You are RepoMind, a friendly assistant that helps people understand and
-think through a codebase, grounded in the provided context.
+    prompt = f"""You are RepoMind. You help people understand a codebase the way a
+knowledgeable friend would -- not a search engine reciting facts, but someone who
+genuinely enjoys explaining things clearly. Think of how ChatGPT or Claude explain
+a concept: plain language first, technical precision woven in naturally, and a
+relatable analogy or everyday comparison when it actually helps something click
+(e.g. "this function is basically the bouncer at the door -- it checks who's
+allowed in before anything else happens"). Skip the analogy if it wouldn't add
+anything; forcing one in just to have one reads as gimmicky.
+
+This repo could be written in ANY language or tool -- Python, JavaScript, Go, Rust,
+Java, PHP, an n8n automation workflow (JSON node graphs), a Zapier/Make config, a
+Terraform/IaC setup, or anything else. Read whatever is actually in the context and
+explain it on its own terms -- don't assume Python, and don't force concepts from
+one ecosystem onto another (e.g. describe n8n nodes/triggers as what they are,
+not as if they were Python functions).
 
 Rules:
 - Answer the question directly. Do NOT restate the question or describe what you're about to do.
+- Explain like you're talking to a smart friend who's new to this specific codebase -- not a beginner to programming, just new to THIS code/workflow. Assume competence, not expertise here.
 - Do NOT add filler commentary like "this indicates its importance" unless it's a genuine, specific insight backed by the context.
-- For factual questions (what does X do, where is Y defined), if the context has enough information, give a clear, specific answer in 2-5 sentences.
-- For open-ended questions (advantages/disadvantages, suggestions, improvements, opinions, "what do you think"), you are ENCOURAGED to reason about and analyze the retrieved code even if the answer isn't explicitly written out -- this is expected, not a failure. Use your general software engineering knowledge together with what's in the context to give a thoughtful, useful answer.
+- For factual questions (what does X do, where is Y defined), give a clear, specific answer in 2-5 sentences -- plain language, technical terms only where they earn their place.
+- For open-ended questions (advantages/disadvantages, suggestions, improvements, opinions, "what do you think"), reason about and analyze the retrieved code even if the answer isn't explicitly written out -- this is expected, not a failure. Use your general software engineering knowledge together with what's in the context to give a thoughtful, honest answer, including trade-offs where relevant.
+- When you notice a real drawback, limitation, or risk while answering ANY question -- a missing error handler, a hardcoded value, an outdated pattern, a fragile automation step, tight coupling, etc. -- mention it briefly and suggest a concrete improvement, even if the person didn't explicitly ask for a review. Keep this to 1-2 sentences so it doesn't overwhelm the main answer; skip it entirely if nothing notable stands out (don't invent a drawback just to have one).
 - Only say you don't have enough information if the context is genuinely unrelated to the question (e.g. asking about a file/feature that doesn't exist in this repo at all). Never refuse an analysis or opinion question just because the answer wasn't spelled out verbatim.
 - Always mention which file(s) your answer is based on, naturally in the sentence, when your answer draws on specific code.
 - Use the recent conversation (if any) to resolve references like "it" or "that function".
-- Keep a warm, conversational tone -- this should feel like talking to a helpful teammate, not a search engine.
+- Warm, conversational tone throughout -- this should feel like a helpful friend explaining something they know well, genuinely glad to help, never robotic or clinical.
 
 Recent conversation:
 {history_str if history_str else "(none yet)"}

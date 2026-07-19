@@ -94,7 +94,17 @@ def _short_label(path: str) -> str:
 def _extract_imports_from_text(source_text: str):
     """Safely parse import statements out of a chunk of Python source.
     Returns [] on ANY error -- a single malformed/partial chunk must never
-    crash diagram generation for the whole repo."""
+    crash diagram generation for the whole repo.
+
+    For "from a.b.c import x" style absolute imports, BOTH the first segment
+    ("a", the top-level package name) and the last segment ("c", the actual
+    submodule/file) are returned as candidates. This matters because internal
+    imports like "from click.core import Group" refer to the real file
+    core.py -- matching only the first segment would look for a file named
+    "click.py", which doesn't exist (click is the package folder, not a
+    file), silently missing real internal edges. Relative imports
+    ("from .core import x") are unaffected by this since node.module is
+    already just "core" with no package prefix."""
     try:
         tree = ast.parse(source_text)
     except Exception:
@@ -103,20 +113,16 @@ def _extract_imports_from_text(source_text: str):
     try:
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
-                imports.extend(alias.name.split(".")[0] for alias in node.names)
-            elif isinstance(node, ast.ImportFrom):
-                if node.module:
-                    # "from module import x" or "from .module import x"
-                    imports.append(node.module.split(".")[0])
-                else:
-                    # Bare relative import: "from . import x, y" -- x and y
-                    # ARE the internal module names being imported directly.
-                    # node.module is None here (only dots, no name after them),
-                    # so without this branch these edges get silently dropped --
-                    # this is a very common pattern in real packages (e.g. Click's
-                    # "from . import globals as globals_"), and skipping it was
-                    # why diagrams looked far sparser than the repo actually is.
-                    imports.extend(alias.name.split(".")[0] for alias in node.names)
+                for alias in node.names:
+                    parts = alias.name.split(".")
+                    imports.append(parts[0])
+                    if len(parts) > 1:
+                        imports.append(parts[-1])
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                parts = node.module.split(".")
+                imports.append(parts[0])
+                if len(parts) > 1:
+                    imports.append(parts[-1])
     except Exception:
         return []
     return imports
@@ -253,83 +259,6 @@ def graph_to_mermaid(graph: dict) -> str:
             lines.append(f'    {safe_id(f)} --> {safe_id(t)}')
 
     return "\n".join(lines)
-
-
-def render_graph_to_png_bytes(graph: dict, group_fn=None) -> bytes:
-    """Renders the same dependency graph as a STATIC PNG image using pure
-    Python (matplotlib + networkx) -- no browser/JS involved. This exists
-    specifically so the diagram can be embedded into a downloadable file
-    (the live in-app view uses interactive Mermaid instead, which only
-    exists inside the browser and can't be captured server-side).
-
-    matplotlib + networkx are plain pip packages (no system binary install,
-    no PATH/permissions issues) -- unlike Graphviz, which needed a separate
-    system-level install this project deliberately avoided.
-
-    Returns PNG image bytes, or None if rendering fails for any reason
-    (e.g. libraries not installed) -- callers should treat None as
-    'skip the image, text export still works'."""
-    try:
-        import io
-        import matplotlib
-        matplotlib.use("Agg")  # headless backend -- no display needed, safe on a server
-        import matplotlib.pyplot as plt
-        import matplotlib.patches as mpatches
-        import networkx as nx
-    except ImportError:
-        return None
-
-    try:
-        if group_fn is None:
-            group_fn = _top_level_group
-
-        G = nx.DiGraph()
-        all_nodes = set(graph.keys())
-        for targets in graph.values():
-            all_nodes.update(targets)
-        for n in all_nodes:
-            G.add_node(n)
-        for f, targets in graph.items():
-            for t in targets:
-                G.add_edge(f, t)
-
-        if G.number_of_nodes() == 0:
-            return None
-
-        # Color nodes by their folder group, same idea as the Mermaid subgraphs.
-        groups = sorted({group_fn(n) for n in G.nodes})
-        palette = plt.cm.tab10.colors
-        group_color = {g: palette[i % len(palette)] for i, g in enumerate(groups)}
-        node_colors = [group_color[group_fn(n)] for n in G.nodes]
-        labels = {n: _short_label(n) for n in G.nodes}
-
-        fig_w = max(10, min(24, G.number_of_nodes() * 0.6))
-        fig_h = max(8, min(18, G.number_of_nodes() * 0.45))
-        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-
-        pos = nx.spring_layout(G, seed=42, k=1.3)
-        nx.draw_networkx_edges(G, pos, ax=ax, edge_color="#999999",
-                                arrows=True, arrowsize=14, width=1.2,
-                                connectionstyle="arc3,rad=0.05")
-        nx.draw_networkx_nodes(G, pos, ax=ax, node_color=node_colors,
-                                node_size=1600, edgecolors="#333333", linewidths=1)
-        nx.draw_networkx_labels(G, pos, labels=labels, ax=ax, font_size=8)
-
-        legend_handles = [mpatches.Patch(color=group_color[g], label=g) for g in groups]
-        ax.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(1.01, 1),
-                   fontsize=8, title="Folder")
-
-        ax.set_title("Repository Architecture -- Module Dependencies", fontsize=13)
-        ax.axis("off")
-        fig.tight_layout()
-
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        buf.seek(0)
-        return buf.getvalue()
-    except Exception:
-        return None
 
 
 def render_mermaid(mermaid_code: str, height: int = 550):

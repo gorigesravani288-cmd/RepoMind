@@ -19,6 +19,8 @@ EXECUTION:
 
 import os
 import base64
+import json
+import uuid
 import streamlit as st
 from dotenv import load_dotenv
 import chromadb
@@ -32,6 +34,120 @@ from ingest import ingest_repo, DB_PATH, COLLECTION_NAME
 load_dotenv()
 
 st.set_page_config(page_title="RepoMind", page_icon="🧠", layout="wide")
+
+# ---------------------------------------------------------------------------
+# Session persistence: survives a page refresh, which normally wipes
+# st.session_state entirely (that's plain Streamlit behavior, not a bug in
+# this app specifically -- a browser refresh starts a brand new session).
+#
+# How it works: a random session ID is put in the URL the first time someone
+# visits. On every refresh, the SAME URL (with the same ID) is requested, so
+# we can look up and restore the saved conversation from a small local JSON
+# file keyed by that ID.
+#
+# Known limitation: the underlying vector index (ChromaDB) uses ONE global
+# collection for whichever repo was indexed most recently (see ingest.py) --
+# it isn't per-session. So this restores your chat text and repo name
+# correctly, but if a different repo was indexed in the meantime (e.g. by
+# you in another tab), the restored chat would reference a repo whose index
+# has since been overwritten. Fine for normal single-user use; worth knowing
+# if you ever open multiple repos in parallel tabs.
+# ---------------------------------------------------------------------------
+SESSIONS_DIR = "./sessions"
+os.makedirs(SESSIONS_DIR, exist_ok=True)
+
+
+RECENT_REPOS_FILE = os.path.join(SESSIONS_DIR, "recent_repos.json")
+MAX_RECENT_REPOS = 8
+
+
+def load_recent_repos() -> list:
+    """Returns the list of previously indexed repo URLs, most recent first.
+    Shared across all visitors (it's just a convenience list of public repo
+    URLs, nothing sensitive) -- returns [] on any error rather than crashing
+    the sidebar."""
+    try:
+        if not os.path.exists(RECENT_REPOS_FILE):
+            return []
+        with open(RECENT_REPOS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def add_recent_repo(repo_url: str):
+    """Adds a repo to the recent list (most recent first, deduplicated,
+    capped at MAX_RECENT_REPOS). Fails silently -- this is a nice-to-have,
+    never something that should block indexing if disk I/O has an issue."""
+    try:
+        recents = load_recent_repos()
+        recents = [r for r in recents if r != repo_url]  # move to front if already there
+        recents.insert(0, repo_url)
+        recents = recents[:MAX_RECENT_REPOS]
+        with open(RECENT_REPOS_FILE, "w", encoding="utf-8") as f:
+            json.dump(recents, f)
+    except Exception:
+        pass
+
+
+def _session_file(session_id: str) -> str:
+    # session_id is our own uuid4, so this is safe from path traversal
+    return os.path.join(SESSIONS_DIR, f"{session_id}.json")
+
+
+def save_session_state():
+    """Persists the parts of session_state needed to restore a conversation
+    after a refresh. Fails silently (never blocks the UI) if disk I/O has
+    any issue -- persistence is a nice-to-have, not something that should
+    ever break the actual chat."""
+    try:
+        session_id = st.session_state.get("_session_id")
+        if not session_id:
+            return
+        data = {
+            "indexed_repo": st.session_state.get("indexed_repo"),
+            "repo_summary": st.session_state.get("repo_summary"),
+            "messages": st.session_state.get("messages", []),
+        }
+        with open(_session_file(session_id), "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def load_session_state(session_id: str) -> bool:
+    """Restores a previously saved conversation into session_state.
+    Returns True if something was actually restored, False otherwise
+    (no file, corrupted file, etc. -- all handled gracefully, just starts
+    fresh in that case rather than erroring)."""
+    try:
+        path = _session_file(session_id)
+        if not os.path.exists(path):
+            return False
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("indexed_repo"):
+            st.session_state["indexed_repo"] = data["indexed_repo"]
+        if data.get("repo_summary"):
+            st.session_state["repo_summary"] = data["repo_summary"]
+        st.session_state["messages"] = data.get("messages", [])
+        return True
+    except Exception:
+        return False
+
+
+# Get or create this browser tab's session ID from the URL.
+_url_sid = st.query_params.get("sid")
+if _url_sid:
+    st.session_state["_session_id"] = _url_sid
+elif "_session_id" not in st.session_state:
+    st.session_state["_session_id"] = uuid.uuid4().hex
+    st.query_params["sid"] = st.session_state["_session_id"]
+
+# If this is a fresh session_state (i.e. right after a refresh -- "messages"
+# won't exist yet) but the URL has a known session ID, restore it.
+if "messages" not in st.session_state:
+    load_session_state(st.session_state["_session_id"])
 
 # ---------------------------------------------------------------------------
 # Styling
@@ -125,115 +241,17 @@ Follow-up question: {question}
 Rewritten standalone query:"""
 
     try:
-        client = Groq(api_key=api_key, timeout=15.0)
+        client = Groq(api_key=api_key)
         response = client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
             max_tokens=100,
-            timeout=15.0,
         )
         rewritten = response.choices[0].message.content.strip().strip('"')
         return rewritten if rewritten else question
     except Exception:
         return question
-
-
-import re
-
-# Vocabulary of casual/filler words and common slang abbreviations. A message
-# is treated as casual if EVERY word in it belongs to this set -- this is
-# what lets combinations like "ok tq" or "u r sweet" get caught, since it
-# doesn't rely on matching one exact pre-written phrase the way a fixed
-# regex list does.
-_CASUAL_WORDS = {
-    # thanks / acknowledgment
-    "ok", "okay", "kk", "k", "thanks", "thank", "thankyou", "thx", "tq", "ty",
-    "np", "welcome", "appreciate", "appreciated", "cool", "nice", "great",
-    "good", "awesome", "sweet", "perfect", "superb", "excellent", "amazing",
-    "wow", "sounds", "got", "it", "alright", "sure",
-    # yes/no/filler
-    "yes", "yep", "yeah", "yup", "no", "nope", "nah",
-    # greetings/farewell
-    "hi", "hello", "hey", "yo", "sup", "wassup", "bye", "goodbye", "morning",
-    "evening", "night",
-    # you / are (for "u r sweet", "you are great", etc.)
-    "u", "ur", "you", "youre", "r", "are", "so", "very", "much", "this",
-    # laughter / mood
-    "lol", "haha", "hehe", "lmao", "nvm", "nevermind", "never", "mind",
-    "love", "loved", "well", "done", "job", "one", "work", "lot", "a", "there",
-}
-
-
-def is_casual_message(text: str) -> bool:
-    """Detects casual/conversational messages (thanks, compliments,
-    greetings, slang acknowledgments) so they get a natural reply instead
-    of being run through code retrieval, which would otherwise find nothing
-    relevant and produce an unhelpful, oddly-cited response. A message
-    counts as casual only if EVERY word in it is in the casual vocabulary
-    AND it's short (<=6 words) -- this keeps real short questions like
-    "why?" or "is this thread safe" going to retrieval as normal, since
-    "thread"/"safe"/"why" aren't in the casual vocabulary."""
-    cleaned = text.strip().lower()
-    words = re.findall(r"[a-z']+", cleaned)
-    if not words or len(words) > 6:
-        return False
-    return all(w in _CASUAL_WORDS for w in words)
-
-
-def casual_reply(question: str, api_key: str) -> str:
-    """Generates a short, natural reply to casual messages without touching
-    retrieval/ChromaDB at all. Falls back to a canned reply if no API key
-    is available, so this never hard-fails."""
-    if not api_key:
-        return "👍 Let me know if you'd like to ask anything else about the repo!"
-    try:
-        client = Groq(api_key=api_key, timeout=15.0)
-        response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{
-                "role": "user",
-                "content": (
-                    f'The user said: "{question}" in a chat about a codebase. '
-                    "Reply the way a warm, genuine friend would -- brief (1 sentence), "
-                    "casual, a little personality is welcome. "
-                    "as a normal conversational reply -- do not mention code, "
-                    "files, or retrieval."
-                ),
-            }],
-            temperature=0.5,
-            max_tokens=40,
-            timeout=15.0,
-        )
-        return response.choices[0].message.content.strip()
-    except Exception:
-        return "👍 Let me know if you'd like to ask anything else about the repo!"
-
-
-_HELP_PATTERNS = re.compile(
-    r"(what can (you|i) (do|ask)|help me|how does this work|"
-    r"what (are|is) (your|the) (features|capabilities)|what should i ask)",
-    re.IGNORECASE,
-)
-
-
-def is_help_question(text: str) -> bool:
-    """Detects meta-questions about what RepoMind can do, so they get a
-    direct capabilities summary instead of being run through code retrieval
-    (which would find nothing relevant and refuse)."""
-    return bool(_HELP_PATTERNS.search(text.strip()))
-
-
-def help_reply(repo_name: str) -> str:
-    return (
-        f"Happy to help! Here's what you can ask me about **{repo_name}**:\n\n"
-        "- **Factual questions** — \"What does `parse_config` do?\", \"Where is auth handled?\"\n"
-        "- **Open-ended analysis** — \"What are the pros and cons of this structure?\", "
-        "\"Any suggestions to improve this?\"\n"
-        "- **Architecture** — say \"diagram the architecture\" for a visual module map\n"
-        "- **Follow-ups** — I remember recent context, so \"can you show an example?\" works too\n\n"
-        "Just ask naturally — no special syntax needed!"
-    )
 
 
 def _safe_get_secret(key: str):
@@ -265,63 +283,51 @@ def ask_llm(question: str, context_chunks, api_key: str, history=None) -> str:
         recent = history[-4:]
         history_str = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in recent)
 
-    prompt = f"""You are RepoMind. You help people understand a codebase the way a
-knowledgeable friend would -- not a search engine reciting facts, but someone who
-genuinely enjoys explaining things clearly. Think of how ChatGPT or Claude explain
-a concept: plain language first, technical precision woven in naturally, and a
-relatable analogy or everyday comparison when it actually helps something click
-(e.g. "this function is basically the bouncer at the door -- it checks who's
-allowed in before anything else happens"). Skip the analogy if it wouldn't add
-anything; forcing one in just to have one reads as gimmicky.
-
-This repo could be written in ANY language or tool -- Python, JavaScript, Go, Rust,
-Java, PHP, an n8n automation workflow (JSON node graphs), a Zapier/Make config, a
-Terraform/IaC setup, or anything else. Read whatever is actually in the context and
-explain it on its own terms -- don't assume Python, and don't force concepts from
-one ecosystem onto another (e.g. describe n8n nodes/triggers as what they are,
-not as if they were Python functions).
+    prompt = f"""You are RepoMind, a friendly, knowledgeable coding assistant. You're currently
+helping someone explore a specific codebase, but you are NOT limited to only answering
+questions about that repo -- you're a capable, general conversational assistant who happens
+to also have this repo's code available as extra context when it's relevant.
 
 Rules:
 - Answer the question directly. Do NOT restate the question or describe what you're about to do.
-- Explain like you're talking to a smart friend who's new to this specific codebase -- not a beginner to programming, just new to THIS code/workflow. Assume competence, not expertise here.
 - Do NOT add filler commentary like "this indicates its importance" unless it's a genuine, specific insight backed by the context.
-- For factual questions (what does X do, where is Y defined), give a clear, specific answer in 2-5 sentences -- plain language, technical terms only where they earn their place.
-- For open-ended questions (advantages/disadvantages, suggestions, improvements, opinions, "what do you think"), reason about and analyze the retrieved code even if the answer isn't explicitly written out -- this is expected, not a failure. Use your general software engineering knowledge together with what's in the context to give a thoughtful, honest answer, including trade-offs where relevant.
-- When you notice a real drawback, limitation, or risk while answering ANY question -- a missing error handler, a hardcoded value, an outdated pattern, a fragile automation step, tight coupling, etc. -- mention it briefly and suggest a concrete improvement, even if the person didn't explicitly ask for a review. Keep this to 1-2 sentences so it doesn't overwhelm the main answer; skip it entirely if nothing notable stands out (don't invent a drawback just to have one).
-- Only say you don't have enough information if the context is genuinely unrelated to the question (e.g. asking about a file/feature that doesn't exist in this repo at all). Never refuse an analysis or opinion question just because the answer wasn't spelled out verbatim.
-- Always mention which file(s) your answer is based on, naturally in the sentence, when your answer draws on specific code.
+- If the question is about THIS repo and the provided context covers it, give a clear, specific, useful answer in 2-5 sentences, and naturally mention which file(s) it's based on.
+- If the question is about this repo but the context doesn't fully cover it, briefly say so, then still help using your own general knowledge -- suggestions, best practices, addon/feature ideas, or a general explanation. Signal the shift naturally (e.g. "the repo doesn't show this directly, but generally...").
+- If the question is general programming/tech/advice and isn't really about this specific repo at all, just answer it normally and helpfully using your own knowledge -- you don't need repo context to answer general questions, and you should never refuse or deflect a reasonable question just because the repo's code doesn't mention it.
+- If asked for suggestions, improvement ideas, or addon ideas, answer directly and helpfully, combining anything relevant from the context with your own good judgment.
+- Keep a warm, natural, conversational tone throughout -- like chatting with a helpful, knowledgeable teammate, not querying a lookup tool.
 - Use the recent conversation (if any) to resolve references like "it" or "that function".
-- Warm, conversational tone throughout -- this should feel like a helpful friend explaining something they know well, genuinely glad to help, never robotic or clinical.
 
 Recent conversation:
 {history_str if history_str else "(none yet)"}
 
-Context:
+Context from the repo (use it when relevant to the question; ignore it when the question is general and doesn't need it):
 {context_str}
 
 Question: {question}
 
 Answer:"""
 
-    client = Groq(api_key=api_key, timeout=30.0)
-    for attempt in range(2):  # try once, retry once on timeout before giving up
-        try:
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-                timeout=30.0,
-            )
-            return response.choices[0].message.content
-        except Exception:
-            continue
-    # Both attempts failed (timeout or other API error) -- degrade gracefully
-    # instead of letting this crash the whole Streamlit app.
-    return (
-        "Sorry, that took too long to answer (the AI service timed out). "
-        "This can happen on longer or more complex questions -- mind trying "
-        "again, or asking something more specific?"
-    )
+    try:
+        client = Groq(api_key=api_key, timeout=25.0)
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.4,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        # Groq can time out or briefly rate-limit -- never let that crash the
+        # whole app with a raw traceback. Show a clear, friendly message and
+        # let the person just try again.
+        err_text = str(e).lower()
+        if "timeout" in err_text or "timed out" in err_text:
+            return ("⏱️ The response took too long and timed out. This can happen when Groq's "
+                    "free tier is busy — please try asking again in a moment.")
+        if "rate limit" in err_text or "429" in err_text:
+            return ("⏳ Hit a rate limit on the free API tier. Please wait a few seconds and try again.")
+        return (f"⚠️ Something went wrong reaching the AI model ({type(e).__name__}). "
+                "Please try asking again.")
 
 
 def generate_summary(api_key: str) -> str:
@@ -336,17 +342,16 @@ Excerpts:
 {context_str}
 
 Summary:"""
-    client = Groq(api_key=api_key, timeout=20.0)
+    client = Groq(api_key=api_key, timeout=25.0)
     try:
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
-            timeout=20.0,
         )
         return response.choices[0].message.content
     except Exception:
-        return "(Summary unavailable right now -- the AI service timed out. You can still ask questions below.)"
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -356,11 +361,27 @@ with st.sidebar:
     _preloaded_key = _safe_get_secret("GROQ_API_KEY") or os.getenv("GROQ_API_KEY")
 
     st.markdown('<div class="rm-step-label">Step 1 · Index a repo</div>', unsafe_allow_html=True)
+
+    # Clicking a recent repo pre-fills the URL box via session_state, since a
+    # text_input's value can only be set before it's instantiated, not after.
+    _prefill = st.session_state.pop("_prefill_repo_url", "")
     repo_url = st.text_input(
-        "GitHub repo URL", placeholder="https://github.com/user/repo", label_visibility="collapsed",
+        "GitHub repo URL", value=_prefill, placeholder="https://github.com/user/repo",
+        label_visibility="collapsed", key="repo_url_box",
     )
     index_clicked = st.button("🔍  Index Repo", type="primary", use_container_width=True)
     st.caption("⏱️ Small repos: ~30-60s. Larger repos: a few minutes (free-tier CPU).")
+
+    _recent_repos = load_recent_repos()
+    if _recent_repos:
+        with st.expander(f"🕘 Recent repos ({len(_recent_repos)})"):
+            for r in _recent_repos:
+                short_name = r.rstrip("/").split("/")[-1]
+                if st.button(f"📎 {short_name}", key=f"recent_{r}", use_container_width=True,
+                             help=r):
+                    st.session_state["_prefill_repo_url"] = r
+                    st.rerun()
+            st.caption("Clicking a repo fills in the URL above — click **Index Repo** to re-index it.")
 
     if index_clicked:
         if not repo_url.strip():
@@ -377,6 +398,7 @@ with st.sidebar:
                     st.session_state["last_index_count"] = n_chunks
                     st.session_state["last_index_stats"] = stats
                     st.session_state["repo_summary"] = None
+                    add_recent_repo(repo_url.strip())
                 except Exception as e:
                     st.error(f"Failed to index repo: {e}")
                     st.stop()
@@ -426,8 +448,14 @@ with st.sidebar:
                 ".user{background:#eef2ff;} .assistant{background:#f7f7f8;}",
                 ".role{font-weight:700;font-size:0.8rem;text-transform:uppercase;",
                 "color:#666;margin-bottom:6px;}",
-                "img{max-width:100%;border:1px solid #ddd;border-radius:8px;margin-top:10px;}",
+                "img{max-width:100%;display:block;border:1px solid #ddd;border-radius:8px;margin-top:10px;}",
                 ".sources{font-size:0.8rem;color:#555;margin-top:8px;}",
+                ".diagram-wrap{position:relative;display:inline-block;max-width:100%;margin-top:10px;}",
+                ".diagram-toolbar{position:absolute;top:8px;right:8px;display:flex;gap:6px;}",
+                ".icon-btn{background:rgba(255,255,255,0.92);border:1px solid #ccc;border-radius:6px;",
+                "padding:5px 9px;cursor:pointer;font-size:0.95rem;text-decoration:none;color:#333;",
+                "box-shadow:0 1px 3px rgba(0,0,0,0.15);}",
+                ".icon-btn:hover{background:#fff;}",
                 "</style></head><body>",
                 f"<h1>🧠 RepoMind conversation — {repo_name}</h1>",
             ]
@@ -441,8 +469,16 @@ with st.sidebar:
                 html_parts.append(f"<div>{m['content']}</div>")
 
                 if m.get("diagram_png_b64"):
+                    b64 = m["diagram_png_b64"]
                     html_parts.append(
-                        f'<img src="data:image/png;base64,{m["diagram_png_b64"]}" alt="Architecture diagram">'
+                        f'<div class="diagram-wrap">'
+                        f'<img src="data:image/png;base64,{b64}" alt="Architecture diagram">'
+                        f'<div class="diagram-toolbar">'
+                        f'<a class="icon-btn" href="data:image/png;base64,{b64}" '
+                        f'download="repo_architecture_diagram.png" title="Download image">⬇️</a>'
+                        f'<button class="icon-btn" onclick="copyDiagramImage(\'{b64}\', this)" '
+                        f'title="Copy image">📋</button>'
+                        f'</div></div>'
                     )
                 elif m.get("mermaid"):
                     # Image render failed at generation time (e.g. no internet)
@@ -459,6 +495,27 @@ with st.sidebar:
                     html_parts.append(f'<div class="sources">Sources: {srcs}</div>')
                 html_parts.append("</div>")
 
+            html_parts.append("""
+            <script>
+            async function copyDiagramImage(b64, btn) {
+                try {
+                    const byteChars = atob(b64);
+                    const byteNumbers = new Array(byteChars.length);
+                    for (let i = 0; i < byteChars.length; i++) {
+                        byteNumbers[i] = byteChars.charCodeAt(i);
+                    }
+                    const byteArray = new Uint8Array(byteNumbers);
+                    const blob = new Blob([byteArray], {type: "image/png"});
+                    await navigator.clipboard.write([new ClipboardItem({"image/png": blob})]);
+                    const original = btn.innerHTML;
+                    btn.innerHTML = "✅";
+                    setTimeout(() => { btn.innerHTML = original; }, 1500);
+                } catch (e) {
+                    alert("Copy isn't supported in this browser/context. Please use the download button instead.");
+                }
+            }
+            </script>
+            """)
             html_parts.append("</body></html>")
             combined_html = "\n".join(html_parts)
 
@@ -507,10 +564,19 @@ else:
     if not st.session_state["messages"]:
         st.info(f"💬 Ready! Ask anything about **{st.session_state['indexed_repo'].split('/')[-1]}**.")
 
-for msg in st.session_state["messages"]:
+for i, msg in enumerate(st.session_state["messages"]):
     avatar = "🙋" if msg["role"] == "user" else "🧠"
     with st.chat_message(msg["role"], avatar=avatar):
-        st.markdown(msg["content"])
+        if msg["role"] == "user":
+            col_text, col_edit = st.columns([20, 1])
+            with col_text:
+                st.markdown(msg["content"])
+            with col_edit:
+                if st.button("✏️", key=f"edit_btn_{i}", help="Edit and resend this message"):
+                    st.session_state["_editing_index"] = i
+                    st.rerun()
+        else:
+            st.markdown(msg["content"])
         if msg.get("mermaid"):
             render_mermaid(msg["mermaid"])
             with st.expander("View diagram code (paste into mermaid.live to view/edit)"):
@@ -526,11 +592,93 @@ for msg in st.session_state["messages"]:
                     st.caption(f"{s['file']} (line {s['start_line']})")
                     st.code(s["text"], language="python")
 
+# If a message is being edited, show an inline edit box instead of (or above)
+# the normal chat input, prefilled with the original text.
+edited_question = None
+if st.session_state.get("_editing_index") is not None:
+    edit_idx = st.session_state["_editing_index"]
+    original_text = st.session_state["messages"][edit_idx]["content"]
+    st.info("✏️ Editing your message — this will remove it and everything after it, then re-ask with your edit.")
+    new_text = st.text_area("Edit your message:", value=original_text, key="_edit_textarea")
+    col_save, col_cancel = st.columns([1, 1])
+    with col_save:
+        if st.button("✅ Save & resend", use_container_width=True):
+            # Remove this message and everything after it, then treat the
+            # edited text exactly like a freshly typed question.
+            st.session_state["messages"] = st.session_state["messages"][:edit_idx]
+            st.session_state["_editing_index"] = None
+            edited_question = new_text
+    with col_cancel:
+        if st.button("❌ Cancel", use_container_width=True):
+            st.session_state["_editing_index"] = None
+            st.rerun()
+
 question = st.chat_input("Ask something about the indexed repo...")
+if not question and edited_question:
+    question = edited_question
+
+CASUAL_RESPONSES = {
+    "ok": "👍 Got it! Let me know if you have more questions about this repo.",
+    "okay": "👍 Got it! Let me know if you have more questions about this repo.",
+    "k": "👍 Let me know if you'd like to know more about this repo.",
+    "cool": "😊 Glad that helped! Feel free to ask anything else about the repo.",
+    "nice": "😊 Glad that helped! Feel free to ask anything else about the repo.",
+    "great": "😊 Glad that helped! Feel free to ask anything else about the repo.",
+    "thanks": "You're welcome! 🙌 Ask away if there's anything else about this repo you'd like to know.",
+    "thank you": "You're welcome! 🙌 Ask away if there's anything else about this repo you'd like to know.",
+    "thankyou": "You're welcome! 🙌 Ask away if there's anything else about this repo you'd like to know.",
+    "ty": "You're welcome! 🙌",
+    "hi": "Hey! 👋 I'm ready to help — ask me anything about the indexed repo, or try \"show me the architecture of this repo\".",
+    "hello": "Hey! 👋 I'm ready to help — ask me anything about the indexed repo, or try \"show me the architecture of this repo\".",
+    "hey": "Hey! 👋 What would you like to know about this repo?",
+    "yo": "Hey! 👋 What would you like to know about this repo?",
+    "bye": "Bye! 👋 Come back anytime you want to explore another repo.",
+    "goodbye": "Bye! 👋 Come back anytime you want to explore another repo.",
+    "yes": "Got it 👍 — what would you like to know?",
+    "no": "No worries — let me know if there's anything else I can help with.",
+    "sure": "👍 Go ahead and ask whenever you're ready.",
+    "yep": "👍 Go ahead and ask whenever you're ready.",
+    "nope": "No worries — let me know if there's anything else I can help with.",
+    "good": "😊 Glad to hear it! Ask me anything else about the repo.",
+    "good job": "Thank you! 😊 Happy to help with anything else about this repo.",
+    "wow": "😄 Right? Let me know if you'd like to dig into anything specific.",
+    "haha": "😄 Glad you liked that! Anything else you'd like to explore in the repo?",
+}
+
+
+def is_casual_chat(text: str) -> str | None:
+    """Checks if a message is casual conversation (greeting, thanks, filler)
+    rather than a real question about the repo. Returns a friendly canned
+    reply if so, or None if it looks like a genuine question that should go
+    through the normal RAG pipeline instead.
+
+    This is intentionally a simple exact-match check on short inputs only --
+    it deliberately does NOT try to catch every possible casual phrase, since
+    being overly aggressive here risks swallowing real short questions like
+    "why" or "how" and answering them with a canned greeting instead. When in
+    doubt, this returns None and lets the real pipeline (which is much
+    smarter) handle it."""
+    normalized = text.strip().lower().strip("!.,?")
+    if normalized in CASUAL_RESPONSES:
+        return CASUAL_RESPONSES[normalized]
+    return None
+
 
 if question:
+    _casual_reply = is_casual_chat(question) if "indexed_repo" in st.session_state else None
     if "indexed_repo" not in st.session_state:
         st.warning("Index a repo first using the sidebar.")
+    elif _casual_reply:
+        # Pure conversational filler ("ok", "thanks", "hi") gets an instant
+        # canned reply -- no API call needed, no cost, no latency, and
+        # crucially: never a robotic "I couldn't find that in the context"
+        # response to something that was never a real question.
+        st.session_state["messages"].append({"role": "user", "content": question, "sources": None})
+        with st.chat_message("user", avatar="🙋"):
+            st.markdown(question)
+        with st.chat_message("assistant", avatar="🧠"):
+            st.markdown(_casual_reply)
+        st.session_state["messages"].append({"role": "assistant", "content": _casual_reply, "sources": None})
     elif "architecture" in question.lower() or "diagram" in question.lower():
         # Diagram requests are handled separately from the normal RAG flow --
         # this needs no Groq API key at all, since it's pure local analysis
@@ -576,23 +724,6 @@ if question:
             {"role": "assistant", "content": reply, "sources": None,
              "mermaid": mermaid_code or None, "diagram_png_b64": diagram_png_b64}
         )
-    elif is_casual_message(question):
-        st.session_state["messages"].append({"role": "user", "content": question, "sources": None})
-        with st.chat_message("user", avatar="🙋"):
-            st.markdown(question)
-        with st.chat_message("assistant", avatar="🧠"):
-            reply = casual_reply(question, groq_key)
-            st.markdown(reply)
-        st.session_state["messages"].append({"role": "assistant", "content": reply, "sources": None})
-    elif is_help_question(question):
-        st.session_state["messages"].append({"role": "user", "content": question, "sources": None})
-        with st.chat_message("user", avatar="🙋"):
-            st.markdown(question)
-        with st.chat_message("assistant", avatar="🧠"):
-            repo_name = st.session_state["indexed_repo"].split("/")[-1]
-            reply = help_reply(repo_name)
-            st.markdown(reply)
-        st.session_state["messages"].append({"role": "assistant", "content": reply, "sources": None})
     elif not groq_key:
         st.warning("Add your GROQ_API_KEY in the sidebar.")
     else:
@@ -616,3 +747,7 @@ if question:
                         st.caption(f"{h['file']} (line {h['start_line']})")
                         st.code(h["text"], language="python")
         st.session_state["messages"].append({"role": "assistant", "content": answer, "sources": hits})
+
+# Persist current state so a page refresh can restore it (see the session
+# persistence block near the top of this file for how restoration works).
+save_session_state()

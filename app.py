@@ -125,12 +125,13 @@ Follow-up question: {question}
 Rewritten standalone query:"""
 
     try:
-        client = Groq(api_key=api_key)
+        client = Groq(api_key=api_key, timeout=15.0)
         response = client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
             max_tokens=100,
+            timeout=15.0,
         )
         rewritten = response.choices[0].message.content.strip().strip('"')
         return rewritten if rewritten else question
@@ -187,7 +188,7 @@ def casual_reply(question: str, api_key: str) -> str:
     if not api_key:
         return "👍 Let me know if you'd like to ask anything else about the repo!"
     try:
-        client = Groq(api_key=api_key)
+        client = Groq(api_key=api_key, timeout=15.0)
         response = client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[{
@@ -202,6 +203,7 @@ def casual_reply(question: str, api_key: str) -> str:
             }],
             temperature=0.5,
             max_tokens=40,
+            timeout=15.0,
         )
         return response.choices[0].message.content.strip()
     except Exception:
@@ -301,13 +303,25 @@ Question: {question}
 
 Answer:"""
 
-    client = Groq(api_key=api_key)
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
+    client = Groq(api_key=api_key, timeout=30.0)
+    for attempt in range(2):  # try once, retry once on timeout before giving up
+        try:
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                timeout=30.0,
+            )
+            return response.choices[0].message.content
+        except Exception:
+            continue
+    # Both attempts failed (timeout or other API error) -- degrade gracefully
+    # instead of letting this crash the whole Streamlit app.
+    return (
+        "Sorry, that took too long to answer (the AI service timed out). "
+        "This can happen on longer or more complex questions -- mind trying "
+        "again, or asking something more specific?"
     )
-    return response.choices[0].message.content
 
 
 def generate_summary(api_key: str) -> str:
@@ -322,13 +336,17 @@ Excerpts:
 {context_str}
 
 Summary:"""
-    client = Groq(api_key=api_key)
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-    )
-    return response.choices[0].message.content
+    client = Groq(api_key=api_key, timeout=20.0)
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            timeout=20.0,
+        )
+        return response.choices[0].message.content
+    except Exception:
+        return "(Summary unavailable right now -- the AI service timed out. You can still ask questions below.)"
 
 
 # ---------------------------------------------------------------------------

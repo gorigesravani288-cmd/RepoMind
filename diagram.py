@@ -104,8 +104,19 @@ def _extract_imports_from_text(source_text: str):
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 imports.extend(alias.name.split(".")[0] for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                imports.append(node.module.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    # "from module import x" or "from .module import x"
+                    imports.append(node.module.split(".")[0])
+                else:
+                    # Bare relative import: "from . import x, y" -- x and y
+                    # ARE the internal module names being imported directly.
+                    # node.module is None here (only dots, no name after them),
+                    # so without this branch these edges get silently dropped --
+                    # this is a very common pattern in real packages (e.g. Click's
+                    # "from . import globals as globals_"), and skipping it was
+                    # why diagrams looked far sparser than the repo actually is.
+                    imports.extend(alias.name.split(".")[0] for alias in node.names)
     except Exception:
         return []
     return imports

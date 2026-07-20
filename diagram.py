@@ -102,9 +102,14 @@ def _extract_imports_from_text(source_text: str):
     imports like "from click.core import Group" refer to the real file
     core.py -- matching only the first segment would look for a file named
     "click.py", which doesn't exist (click is the package folder, not a
-    file), silently missing real internal edges. Relative imports
-    ("from .core import x") are unaffected by this since node.module is
-    already just "core" with no package prefix."""
+    file), silently missing real internal edges.
+
+    Bare relative imports ("from . import globals, core") are ALSO handled:
+    here node.module is None (only dots, no name after them), so the names
+    being imported ARE themselves the internal module names. This is a very
+    common real-world pattern (e.g. Click's own "from . import globals as
+    globals_") and was previously being silently dropped entirely, since the
+    old code only ran when node.module was truthy."""
     try:
         tree = ast.parse(source_text)
     except Exception:
@@ -118,11 +123,16 @@ def _extract_imports_from_text(source_text: str):
                     imports.append(parts[0])
                     if len(parts) > 1:
                         imports.append(parts[-1])
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                parts = node.module.split(".")
-                imports.append(parts[0])
-                if len(parts) > 1:
-                    imports.append(parts[-1])
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    parts = node.module.split(".")
+                    imports.append(parts[0])
+                    if len(parts) > 1:
+                        imports.append(parts[-1])
+                else:
+                    # Bare relative import: "from . import x, y" -- x and y
+                    # ARE the internal module names being imported directly.
+                    imports.extend(alias.name.split(".")[0] for alias in node.names)
     except Exception:
         return []
     return imports

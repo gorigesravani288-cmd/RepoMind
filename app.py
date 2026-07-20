@@ -289,6 +289,8 @@ questions about that repo -- you're a capable, general conversational assistant 
 to also have this repo's code available as extra context when it's relevant.
 
 Rules:
+- FIRST, judge the tone and intent of the message. If it's casual, informal, small talk, a typo'd greeting, slang, or clearly not a real question (e.g. "hlo bro", "sup", "lol nice") -- even if it doesn't match a common exact phrase -- respond briefly and warmly in matching casual tone, like a real person would. Do NOT treat casual messages as incomplete or unclear technical questions needing clarification, and do NOT say things like "your question isn't quite clear" to a greeting or casual remark.
+- If it's a genuine question or request (about the repo, general tech, or otherwise), treat it as a professional/technical query and answer accordingly with real substance.
 - Answer the question directly. Do NOT restate the question or describe what you're about to do.
 - Do NOT add filler commentary like "this indicates its importance" unless it's a genuine, specific insight backed by the context.
 - If the question is about THIS repo and the provided context covers it, give a clear, specific, useful answer in 2-5 sentences, and naturally mention which file(s) it's based on.
@@ -317,17 +319,21 @@ Answer:"""
         )
         return response.choices[0].message.content
     except Exception as e:
-        # Groq can time out or briefly rate-limit -- never let that crash the
-        # whole app with a raw traceback. Show a clear, friendly message and
-        # let the person just try again.
-        err_text = str(e).lower()
-        if "timeout" in err_text or "timed out" in err_text:
+        # Groq can time out, rate-limit, or reject a request for various
+        # reasons -- never let that crash the whole app with a raw
+        # traceback. Show a clear message AND the real underlying reason
+        # (not just the exception type name) so problems are diagnosable
+        # directly from the chat, without needing to dig through the
+        # terminal/server logs every time.
+        err_text = str(e)
+        err_lower = err_text.lower()
+        if "timeout" in err_lower or "timed out" in err_lower:
             return ("⏱️ The response took too long and timed out. This can happen when Groq's "
                     "free tier is busy — please try asking again in a moment.")
-        if "rate limit" in err_text or "429" in err_text:
+        if "rate limit" in err_lower or "429" in err_lower:
             return ("⏳ Hit a rate limit on the free API tier. Please wait a few seconds and try again.")
-        return (f"⚠️ Something went wrong reaching the AI model ({type(e).__name__}). "
-                "Please try asking again.")
+        return (f"⚠️ Something went wrong reaching the AI model ({type(e).__name__}).\n\n"
+                f"Details: {err_text}\n\nPlease try asking again.")
 
 
 def generate_summary(api_key: str) -> str:
@@ -630,8 +636,13 @@ CASUAL_RESPONSES = {
     "ty": "You're welcome! 🙌",
     "hi": "Hey! 👋 I'm ready to help — ask me anything about the indexed repo, or try \"show me the architecture of this repo\".",
     "hello": "Hey! 👋 I'm ready to help — ask me anything about the indexed repo, or try \"show me the architecture of this repo\".",
+    "hlo": "Hey! 👋 I'm ready to help — ask me anything about the indexed repo, or try \"show me the architecture of this repo\".",
+    "helo": "Hey! 👋 I'm ready to help — ask me anything about the indexed repo, or try \"show me the architecture of this repo\".",
+    "hii": "Hey! 👋 I'm ready to help — ask me anything about the indexed repo, or try \"show me the architecture of this repo\".",
+    "heya": "Hey! 👋 What would you like to know about this repo?",
     "hey": "Hey! 👋 What would you like to know about this repo?",
     "yo": "Hey! 👋 What would you like to know about this repo?",
+    "sup": "Hey! 👋 What would you like to know about this repo?",
     "bye": "Bye! 👋 Come back anytime you want to explore another repo.",
     "goodbye": "Bye! 👋 Come back anytime you want to explore another repo.",
     "yes": "Got it 👍 — what would you like to know?",
@@ -645,6 +656,12 @@ CASUAL_RESPONSES = {
     "haha": "😄 Glad you liked that! Anything else you'd like to explore in the repo?",
 }
 
+# Greeting words that, when combined with a casual address word (e.g. "hi bro",
+# "hlo dude"), should still count as a simple greeting rather than falling
+# through to the full RAG pipeline and confusing the model.
+GREETING_WORDS = {"hi", "hello", "hlo", "helo", "hii", "hey", "heya", "yo", "sup"}
+CASUAL_ADDRESS_WORDS = {"bro", "dude", "man", "buddy", "mate", "friend", "there", "bud"}
+
 
 def is_casual_chat(text: str) -> str | None:
     """Checks if a message is casual conversation (greeting, thanks, filler)
@@ -652,15 +669,25 @@ def is_casual_chat(text: str) -> str | None:
     reply if so, or None if it looks like a genuine question that should go
     through the normal RAG pipeline instead.
 
-    This is intentionally a simple exact-match check on short inputs only --
-    it deliberately does NOT try to catch every possible casual phrase, since
-    being overly aggressive here risks swallowing real short questions like
-    "why" or "how" and answering them with a canned greeting instead. When in
-    doubt, this returns None and lets the real pipeline (which is much
-    smarter) handle it."""
+    Two layers: an exact-match check (e.g. "thanks", "ok"), and a slightly
+    looser check for a greeting word followed only by casual address words
+    (e.g. "hi bro", "hlo dude") -- common real phrasing that a strict
+    exact-match alone would miss, sending it into the RAG pipeline and
+    producing a confusing "I need more context" reply to what was really
+    just a hello.
+
+    This deliberately stays conservative -- it does NOT try to catch every
+    possible casual phrase, since being overly aggressive risks swallowing
+    real short questions like "why" or "how". When in doubt, this returns
+    None and lets the real pipeline (which is much smarter) handle it."""
     normalized = text.strip().lower().strip("!.,?")
     if normalized in CASUAL_RESPONSES:
         return CASUAL_RESPONSES[normalized]
+
+    words = normalized.split()
+    if words and words[0] in GREETING_WORDS and all(w in CASUAL_ADDRESS_WORDS for w in words[1:]):
+        return CASUAL_RESPONSES.get(words[0], CASUAL_RESPONSES["hi"])
+
     return None
 
 

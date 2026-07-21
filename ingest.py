@@ -14,6 +14,7 @@ import os
 import ast
 import shutil
 import tempfile
+import hashlib
 import git
 import chromadb
 from sentence_transformers import SentenceTransformer
@@ -173,16 +174,30 @@ def collect_chunks(repo_dir: str):
     return chunks, stats
 
 
-def get_user_collection_name(username: str) -> str:
-    """Derives a safe, per-user ChromaDB collection name so each logged-in
-    user's indexed repo and chat data are genuinely isolated from every
-    other user -- not just separated in the UI. ChromaDB collection names
-    only allow letters, digits, underscores, and hyphens, so this strips
-    anything else out defensively (auth.py already restricts usernames to
-    a safe character set at signup, but this stays defensive in case that
-    ever changes)."""
-    safe = "".join(c for c in username if c.isalnum() or c in ("_", "-"))
-    return f"{COLLECTION_NAME}_{safe}" if safe else COLLECTION_NAME
+def get_user_collection_name(username: str, repo_url: str = None) -> str:
+    """Derives a safe, per-user (and, when repo_url is given, per-repo)
+    ChromaDB collection name.
+
+    Including the repo matters: without it, indexing a *second* repo under
+    the same account would call delete_collection() on the SAME collection
+    the first repo lives in (see embed_and_store below), silently wiping
+    it. Keying by (user, repo) means each repo a user has ever indexed
+    keeps its own permanent collection -- so re-opening a previously
+    indexed repo from the "recent repos" list can restore it instantly,
+    with zero re-cloning or re-embedding.
+
+    ChromaDB collection names only allow letters, digits, underscores, and
+    hyphens, so this strips anything else out defensively (auth.py already
+    restricts usernames to a safe character set at signup, but this stays
+    defensive in case that ever changes). The repo URL is hashed rather
+    than sanitized-and-concatenated, since a raw URL contains characters
+    ChromaDB rejects and can be arbitrarily long."""
+    safe_user = "".join(c for c in username if c.isalnum() or c in ("_", "-"))
+    base = f"{COLLECTION_NAME}_{safe_user}" if safe_user else COLLECTION_NAME
+    if repo_url:
+        repo_hash = hashlib.sha1(repo_url.strip().lower().encode("utf-8")).hexdigest()[:10]
+        return f"{base}_{repo_hash}"
+    return base
 
 
 def embed_and_store(chunks, repo_url: str, collection_name: str = COLLECTION_NAME):

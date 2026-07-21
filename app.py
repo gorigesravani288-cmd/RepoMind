@@ -18,6 +18,7 @@ EXECUTION:
 """
 
 import os
+import time
 import base64
 import json
 import uuid
@@ -58,45 +59,153 @@ SESSIONS_DIR = "./sessions"
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 
-RECENT_REPOS_FILE = os.path.join(SESSIONS_DIR, "recent_repos.json")
 MAX_RECENT_REPOS = 8
+# How long an unused session file is kept before cleanup sweeps it away.
+# Anonymous (pre-login) sessions are just a random tab ID with no real
+# account behind them, so they're swept aggressively. Username-keyed
+# sessions belong to a real account and are kept much longer, since a
+# user might not log back in for weeks and shouldn't lose their state.
+ANON_SESSION_MAX_AGE_DAYS = 3
+USER_SESSION_MAX_AGE_DAYS = 180
 
 
-def load_recent_repos() -> list:
-    """Returns the list of previously indexed repo URLs, most recent first.
-    Shared across all visitors (it's just a convenience list of public repo
-    URLs, nothing sensitive) -- returns [] on any error rather than crashing
+def _safe_key(key: str) -> str:
+    # key is either our own uuid4 (pre-login) or a validated username
+    # (Auth.py already restricts usernames to a safe alnum/_/- character
+    # set), so this is safe from path traversal either way.
+    return "".join(c for c in key if c.isalnum() or c in ("_", "-"))
+
+
+def _recent_repos_file(username: str) -> str:
+    return os.path.join(SESSIONS_DIR, f"recent_repos_{_safe_key(username)}.json")
+
+
+def load_recent_repos(username: str) -> list:
+    """Returns this user's previously indexed repo URLs, most recent first.
+    Per-user (keyed by username) so one account's repo history is never
+    visible to another -- returns [] on any error rather than crashing
     the sidebar."""
     try:
-        if not os.path.exists(RECENT_REPOS_FILE):
+        path = _recent_repos_file(username)
+        if not os.path.exists(path):
             return []
-        with open(RECENT_REPOS_FILE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return []
 
 
-def add_recent_repo(repo_url: str):
-    """Adds a repo to the recent list (most recent first, deduplicated,
-    capped at MAX_RECENT_REPOS). Fails silently -- this is a nice-to-have,
-    never something that should block indexing if disk I/O has an issue."""
+def add_recent_repo(username: str, repo_url: str):
+    """Adds a repo to this user's recent list (most recent first,
+    deduplicated, capped at MAX_RECENT_REPOS). Fails silently -- this is a
+    nice-to-have, never something that should block indexing if disk I/O
+    has an issue."""
     try:
-        recents = load_recent_repos()
+        recents = load_recent_repos(username)
         recents = [r for r in recents if r != repo_url]  # move to front if already there
         recents.insert(0, repo_url)
         recents = recents[:MAX_RECENT_REPOS]
-        with open(RECENT_REPOS_FILE, "w", encoding="utf-8") as f:
+        with open(_recent_repos_file(username), "w", encoding="utf-8") as f:
             json.dump(recents, f)
     except Exception:
         pass
 
 
-def _session_file(key: str) -> str:
-    # key is either our own uuid4 (pre-login) or a validated username
-    # (auth.py already restricts usernames to a safe alnum/_/- character
-    # set), so this is safe from path traversal either way.
-    safe_key = "".join(c for c in key if c.isalnum() or c in ("_", "-"))
-    return os.path.join(SESSIONS_DIR, f"{safe_key}.json")
+def _repo_history_file(username: str) -> str:
+    return os.path.join(SESSIONS_DIR, f"repo_history_{_safe_key(username)}.json")
+
+
+def load_repo_history(username: str) -> dict:
+    """Returns {repo_url: {messages, repo_summary, last_index_count,
+    last_index_stats, collection_name}} for every repo this user has ever
+    indexed -- this is what lets clicking a "recent repo" jump straight
+    back into that repo's own chat instead of re-cloning and re-embedding
+    it from scratch. Returns {} on any error."""
+    try:
+        path = _repo_history_file(username)
+        if not os.path.exists(path):
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_repo_snapshot(username: str, repo_url: str):
+    """Saves the CURRENT session's state (messages, summary, stats) as
+    this repo's entry in the user's repo history, so switching to another
+    repo and back doesn't lose the conversation. Called after every
+    message and after indexing -- fails silently, same as save_session_state."""
+    try:
+        history = load_repo_history(username)
+        history[repo_url] = {
+            "messages": st.session_state.get("messages", []),
+            "repo_summary": st.session_state.get("repo_summary"),
+            "last_index_count": st.session_state.get("last_index_count"),
+            "last_index_stats": st.session_state.get("last_index_stats"),
+            "collection_name": get_user_collection_name(username, repo_url),
+        }
+        with open(_repo_history_file(username), "w", encoding="utf-8") as f:
+            json.dump(history, f)
+    except Exception:
+        pass
+
+
+
+    return os.path.join(SESSIONS_DIR, f"{_safe_key(key)}.json")
+
+
+def cleanup_old_sessions():
+    """Sweeps stale session/recent-repo files out of ./sessions so the
+    directory doesn't grow forever. Every anonymous visit before login
+    creates a random-UUID session file that's otherwise never cleaned up;
+    this deletes those (and any file) once they've been untouched past
+    their max age. Username-keyed files (real accounts) get a much longer
+    grace period than anonymous tab sessions. Runs a lightweight, best-
+    effort sweep -- any error on any individual file is skipped, never
+    raised, since this must never be able to break app startup."""
+    try:
+        now = time.time()
+        for fname in os.listdir(SESSIONS_DIR):
+            if not fname.endswith(".json") or fname in ("users.json", "login_attempts.json"):
+                continue
+            if fname.startswith("recent_repos_"):
+                continue  # tied to account lifetime, not activity -- leave alone
+            path = os.path.join(SESSIONS_DIR, fname)
+            try:
+                age_days = (now - os.path.getmtime(path)) / 86400
+                stem = fname[:-5]
+                # A hex uuid4 (32 hex chars) is an anonymous tab session;
+                # anything else is a username-keyed account session.
+                is_anon = len(stem) == 32 and all(c in "0123456789abcdef" for c in stem)
+                max_age = ANON_SESSION_MAX_AGE_DAYS if is_anon else USER_SESSION_MAX_AGE_DAYS
+                if age_days > max_age:
+                    os.remove(path)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+# Extension -> language name understood by st.code()'s syntax highlighter.
+# Used so retrieved/displayed code snippets are actually highlighted as
+# their real language instead of always being shown as Python.
+LANGUAGE_BY_EXTENSION = {
+    ".py": "python", ".js": "javascript", ".ts": "typescript", ".tsx": "tsx",
+    ".jsx": "jsx", ".java": "java", ".go": "go", ".rb": "ruby", ".c": "c",
+    ".cpp": "cpp", ".h": "c", ".hpp": "cpp", ".md": "markdown", ".txt": "text",
+    ".json": "json", ".yaml": "yaml", ".yml": "yaml", ".rs": "rust",
+    ".php": "php",
+}
+
+
+def language_for_file(file_path: str) -> str:
+    """Maps a file's extension to the language name st.code() expects, so a
+    retrieved snippet from a .js or .md file isn't syntax-highlighted as if
+    it were Python. Falls back to plain "text" for anything unrecognized
+    (extension-less files like README, LICENSE, Dockerfile, etc.)."""
+    _, ext = os.path.splitext(file_path)
+    return LANGUAGE_BY_EXTENSION.get(ext.lower(), "text")
 
 
 def save_session_state():
@@ -129,6 +238,9 @@ def save_session_state():
         if username:
             with open(_session_file(username), "w", encoding="utf-8") as f:
                 json.dump(data, f)
+            repo_url = st.session_state.get("indexed_repo")
+            if repo_url:
+                save_repo_snapshot(username, repo_url)
     except Exception:
         pass
 
@@ -170,6 +282,18 @@ def load_session_state(session_id: str) -> bool:
         return False
 
 
+@st.cache_resource
+def _run_session_cleanup_once():
+    """st.cache_resource makes this execute exactly once per running app
+    process (not once per user, not once per rerun) -- a cheap, safe way to
+    sweep stale session files on startup without doing a directory listing
+    on every single interaction."""
+    cleanup_old_sessions()
+    return True
+
+
+_run_session_cleanup_once()
+
 # Get or create this browser tab's session ID from the URL.
 _url_sid = st.query_params.get("sid")
 if _url_sid:
@@ -189,7 +313,7 @@ if "messages" not in st.session_state:
         load_session_state(st.session_state["logged_in_user"])
 
 # ---------------------------------------------------------------------------
-# Authentication gate: real per-user signup/login (see auth.py for details
+# Authentication gate: real per-user signup/login (see Auth.py for details
 # and security notes). Nothing below this block runs until logged in.
 # ---------------------------------------------------------------------------
 if not st.session_state.get("logged_in_user"):
@@ -301,11 +425,13 @@ def get_embedder():
 
 
 def current_collection_name() -> str:
-    """Every user's repo data lives in its own ChromaDB collection, named
-    from their username -- this is what makes 'per-user sessions' actually
-    real data isolation, not just a login screen in front of shared data."""
+    """Every (user, repo) pair lives in its own ChromaDB collection -- this
+    is what makes 'per-user sessions' real data isolation between users,
+    AND what lets a user keep multiple previously-indexed repos around at
+    once instead of each new index wiping out the last one."""
     username = st.session_state.get("logged_in_user")
-    return get_user_collection_name(username) if username else COLLECTION_NAME
+    repo_url = st.session_state.get("indexed_repo")
+    return get_user_collection_name(username, repo_url) if username else COLLECTION_NAME
 
 
 def retrieve(query: str, k: int = 5):
@@ -375,7 +501,7 @@ def get_groq_key():
     return key
 
 
-def ask_llm(question: str, context_chunks, api_key: str, history=None) -> str:
+def _build_qa_prompt(question: str, context_chunks, history=None) -> str:
     context_str = "\n\n".join(
         f"[{c['file']} : line {c['start_line']}]\n{c['text']}" for c in context_chunks
     )
@@ -384,7 +510,7 @@ def ask_llm(question: str, context_chunks, api_key: str, history=None) -> str:
         recent = history[-4:]
         history_str = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in recent)
 
-    prompt = f"""You are RepoMind, a friendly, knowledgeable coding assistant. You're currently
+    return f"""You are RepoMind, a friendly, knowledgeable coding assistant. You're currently
 helping someone explore a specific codebase, but you are NOT limited to only answering
 questions about that repo -- you're a capable, general conversational assistant who happens
 to also have this repo's code available as extra context when it's relevant.
@@ -411,6 +537,26 @@ Question: {question}
 
 Answer:"""
 
+
+def _friendly_groq_error(e: Exception) -> str:
+    # Groq can time out, rate-limit, or reject a request for various
+    # reasons -- never let that crash the whole app with a raw traceback.
+    # Show a clear message AND the real underlying reason (not just the
+    # exception type name) so problems are diagnosable directly from the
+    # chat, without needing to dig through the terminal/server logs.
+    err_text = str(e)
+    err_lower = err_text.lower()
+    if "timeout" in err_lower or "timed out" in err_lower:
+        return ("⏱️ The response took too long and timed out. This can happen when Groq's "
+                "free tier is busy — please try asking again in a moment.")
+    if "rate limit" in err_lower or "429" in err_lower:
+        return "⏳ Hit a rate limit on the free API tier. Please wait a few seconds and try again."
+    return (f"⚠️ Something went wrong reaching the AI model ({type(e).__name__}).\n\n"
+            f"Details: {err_text}\n\nPlease try asking again.")
+
+
+def ask_llm(question: str, context_chunks, api_key: str, history=None) -> str:
+    prompt = _build_qa_prompt(question, context_chunks, history=history)
     try:
         client = Groq(api_key=api_key, timeout=25.0)
         response = client.chat.completions.create(
@@ -420,21 +566,40 @@ Answer:"""
         )
         return response.choices[0].message.content
     except Exception as e:
-        # Groq can time out, rate-limit, or reject a request for various
-        # reasons -- never let that crash the whole app with a raw
-        # traceback. Show a clear message AND the real underlying reason
-        # (not just the exception type name) so problems are diagnosable
-        # directly from the chat, without needing to dig through the
-        # terminal/server logs every time.
-        err_text = str(e)
-        err_lower = err_text.lower()
-        if "timeout" in err_lower or "timed out" in err_lower:
-            return ("⏱️ The response took too long and timed out. This can happen when Groq's "
-                    "free tier is busy — please try asking again in a moment.")
-        if "rate limit" in err_lower or "429" in err_lower:
-            return ("⏳ Hit a rate limit on the free API tier. Please wait a few seconds and try again.")
-        return (f"⚠️ Something went wrong reaching the AI model ({type(e).__name__}).\n\n"
-                f"Details: {err_text}\n\nPlease try asking again.")
+        return _friendly_groq_error(e)
+
+
+def ask_llm_stream(question: str, context_chunks, api_key: str, history=None):
+    """Generator version of ask_llm, for use with st.write_stream() so the
+    answer appears token-by-token instead of all at once after a multi-
+    second wait -- matches the README's "fast, real-time-feeling" pitch,
+    since Groq is fast enough that the gap was mostly us buffering the
+    whole response before showing any of it.
+
+    Yields text chunks (deltas). If the request fails before any tokens
+    arrive, yields the same friendly error message ask_llm would have
+    returned, as a single chunk -- st.write_stream renders a generator's
+    yields exactly like it would a single string, so callers don't need
+    to branch on success vs. failure."""
+    prompt = _build_qa_prompt(question, context_chunks, history=history)
+    try:
+        client = Groq(api_key=api_key, timeout=25.0)
+        stream = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.4,
+            stream=True,
+        )
+        got_any = False
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content if chunk.choices else None
+            if delta:
+                got_any = True
+                yield delta
+        if not got_any:
+            yield "⚠️ No response came back — please try asking again."
+    except Exception as e:
+        yield _friendly_groq_error(e)
 
 
 def generate_summary(api_key: str) -> str:
@@ -479,16 +644,51 @@ with st.sidebar:
     index_clicked = st.button("🔍  Index Repo", type="primary", use_container_width=True)
     st.caption("⏱️ Small repos: ~30-60s. Larger repos: a few minutes (free-tier CPU).")
 
-    _recent_repos = load_recent_repos()
+    _recent_repos = load_recent_repos(st.session_state["logged_in_user"])
     if _recent_repos:
         with st.expander(f"🕘 Recent repos ({len(_recent_repos)})"):
             for r in _recent_repos:
                 short_name = r.rstrip("/").split("/")[-1]
                 if st.button(f"📎 {short_name}", key=f"recent_{r}", use_container_width=True,
                              help=r):
-                    st.session_state["_prefill_repo_url"] = r
-                    st.rerun()
-            st.caption("Clicking a repo fills in the URL above — click **Index Repo** to re-index it.")
+                    _username = st.session_state["logged_in_user"]
+                    _collection_name = get_user_collection_name(_username, r)
+                    _history = load_repo_history(_username).get(r)
+                    _collection_still_present = False
+                    if _history:
+                        try:
+                            chromadb.PersistentClient(path=DB_PATH).get_collection(_collection_name)
+                            _collection_still_present = True
+                        except Exception:
+                            _collection_still_present = False
+
+                    if _history and _collection_still_present:
+                        # Jump straight back into this repo -- its vector
+                        # data is still in ChromaDB (each repo gets its own
+                        # collection, so indexing something else never
+                        # touched it) and its chat is restored from disk.
+                        # No re-cloning, no re-embedding, no round trip
+                        # through "Index Repo".
+                        st.session_state["indexed_repo"] = r
+                        st.session_state["messages"] = _history.get("messages", [])
+                        st.session_state["repo_summary"] = _history.get("repo_summary")
+                        st.session_state["last_index_count"] = _history.get("last_index_count")
+                        st.session_state["last_index_stats"] = _history.get("last_index_stats")
+                        st.session_state["_restored"] = False
+                        save_session_state()
+                        st.rerun()
+                    else:
+                        # We've never indexed this repo before on this
+                        # deployment (or its collection was cleared some
+                        # other way) -- fall back to prefilling the URL so
+                        # the user can re-index it deliberately.
+                        st.session_state["_prefill_repo_url"] = r
+                        st.session_state["_recent_repo_missing"] = short_name
+                        st.rerun()
+            st.caption("Click a repo to jump straight back into it — already-indexed repos open instantly.")
+
+    if st.session_state.pop("_recent_repo_missing", None):
+        st.info("That repo's index wasn't found — URL filled in above, click **Index Repo** to rebuild it.")
 
     if index_clicked:
         if not repo_url.strip():
@@ -499,13 +699,16 @@ with st.sidebar:
             groq_key_for_summary = get_groq_key()
             with st.spinner("Cloning, chunking, and embedding the repo... larger repos take longer."):
                 try:
-                    n_chunks, stats = ingest_repo(repo_url.strip(), collection_name=current_collection_name())
+                    _new_collection_name = get_user_collection_name(
+                        st.session_state["logged_in_user"], repo_url.strip()
+                    )
+                    n_chunks, stats = ingest_repo(repo_url.strip(), collection_name=_new_collection_name)
                     st.session_state["indexed_repo"] = repo_url.strip()
                     st.session_state["messages"] = []
                     st.session_state["last_index_count"] = n_chunks
                     st.session_state["last_index_stats"] = stats
                     st.session_state["repo_summary"] = None
-                    add_recent_repo(repo_url.strip())
+                    add_recent_repo(st.session_state["logged_in_user"], repo_url.strip())
                 except Exception as e:
                     st.error(f"Failed to index repo: {e}")
                     st.stop()
@@ -644,6 +847,23 @@ with st.sidebar:
     st.markdown("---")
 
     st.caption(f"👤 Logged in as **{st.session_state['logged_in_user']}**")
+
+    with st.expander("🔒 Change password"):
+        with st.form("change_password_form", clear_on_submit=True):
+            cp_old = st.text_input("Current password", type="password", key="cp_old")
+            cp_new = st.text_input("New password", type="password", key="cp_new")
+            cp_confirm = st.text_input("Confirm new password", type="password", key="cp_confirm")
+            cp_submitted = st.form_submit_button("Update password", use_container_width=True)
+            if cp_submitted:
+                if cp_new != cp_confirm:
+                    st.error("New passwords don't match.")
+                else:
+                    ok, msg = Auth.change_password(st.session_state["logged_in_user"], cp_old, cp_new)
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+
     if st.button("🚪 Log out", use_container_width=True):
         # Clear this browser tab's view completely -- the user's own saved
         # data (under their username file) is left untouched on disk, so
@@ -719,7 +939,7 @@ for i, msg in enumerate(st.session_state["messages"]):
             with st.expander("View retrieved code"):
                 for s in msg["sources"]:
                     st.caption(f"{s['file']} (line {s['start_line']})")
-                    st.code(s["text"], language="python")
+                    st.code(s["text"], language=language_for_file(s["file"]))
 
 # If a message is being edited, show an inline edit box instead of (or above)
 # the normal chat input, prefilled with the original text.
@@ -882,20 +1102,21 @@ if question:
             st.markdown(question)
 
         with st.chat_message("assistant", avatar="🧠"):
-            with st.spinner("Retrieving context and generating answer..."):
-                history_so_far = st.session_state["messages"][:-1]
+            history_so_far = st.session_state["messages"][:-1]
+            with st.spinner("Retrieving relevant context..."):
                 search_query = rewrite_query(question, history_so_far, groq_key)
                 hits = retrieve(search_query)
-                answer = ask_llm(question, hits, groq_key, history=history_so_far)
-                st.markdown(answer)
-                chips = "".join(
-                    f'<span class="rm-source-chip">{h["file"]}:{h["start_line"]}</span>' for h in hits
-                )
-                st.markdown(chips, unsafe_allow_html=True)
-                with st.expander("View retrieved code"):
-                    for h in hits:
-                        st.caption(f"{h['file']} (line {h['start_line']})")
-                        st.code(h["text"], language="python")
+            # Streamed so the answer appears as it's generated, instead of a
+            # multi-second silent wait followed by the whole thing at once.
+            answer = st.write_stream(ask_llm_stream(question, hits, groq_key, history=history_so_far))
+            chips = "".join(
+                f'<span class="rm-source-chip">{h["file"]}:{h["start_line"]}</span>' for h in hits
+            )
+            st.markdown(chips, unsafe_allow_html=True)
+            with st.expander("View retrieved code"):
+                for h in hits:
+                    st.caption(f"{h['file']} (line {h['start_line']})")
+                    st.code(h["text"], language=language_for_file(h["file"]))
         st.session_state["messages"].append({"role": "assistant", "content": answer, "sources": hits})
 
 # Persist current state so a page refresh can restore it (see the session

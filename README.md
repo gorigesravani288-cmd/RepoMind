@@ -2,7 +2,7 @@
 
 # 🧠 RepoMind
 
-**Ask any public GitHub repository questions in plain English — and get answers grounded in the actual source code.**
+**Ask any public GitHub repository questions in plain English — and get answers grounded in the actual source code.**  
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![Streamlit](https://img.shields.io/badge/built%20with-Streamlit-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)

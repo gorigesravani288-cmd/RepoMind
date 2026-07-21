@@ -28,8 +28,9 @@ from sentence_transformers import SentenceTransformer
 from groq import Groq
 import streamlit.components.v1 as components
 from diagram import build_repo_module_graph, trim_to_most_connected, graph_to_mermaid, render_mermaid, mermaid_to_png_bytes
+import Auth
 
-from ingest import ingest_repo, DB_PATH, COLLECTION_NAME
+from ingest import ingest_repo, DB_PATH, COLLECTION_NAME, get_user_collection_name
 
 load_dotenv()
 
@@ -90,27 +91,44 @@ def add_recent_repo(repo_url: str):
         pass
 
 
-def _session_file(session_id: str) -> str:
-    # session_id is our own uuid4, so this is safe from path traversal
-    return os.path.join(SESSIONS_DIR, f"{session_id}.json")
+def _session_file(key: str) -> str:
+    # key is either our own uuid4 (pre-login) or a validated username
+    # (auth.py already restricts usernames to a safe alnum/_/- character
+    # set), so this is safe from path traversal either way.
+    safe_key = "".join(c for c in key if c.isalnum() or c in ("_", "-"))
+    return os.path.join(SESSIONS_DIR, f"{safe_key}.json")
 
 
 def save_session_state():
-    """Persists the parts of session_state needed to restore a conversation
-    after a refresh. Fails silently (never blocks the UI) if disk I/O has
-    any issue -- persistence is a nice-to-have, not something that should
-    ever break the actual chat."""
+    """Persists session state to TWO locations once logged in:
+      1. Keyed by the browser tab's random session ID -- so a plain page
+         refresh (same tab, same URL) restores you without needing to log
+         in again.
+      2. Keyed by username -- so logging in again from ANY device/browser
+         restores your own repo and chat history, not just whatever this
+         particular tab last had.
+    Before login, only (1) applies (there's no username yet).
+    Fails silently (never blocks the UI) if disk I/O has any issue --
+    persistence is a nice-to-have, not something that should ever break
+    the actual chat."""
     try:
-        session_id = st.session_state.get("_session_id")
-        if not session_id:
-            return
         data = {
             "indexed_repo": st.session_state.get("indexed_repo"),
             "repo_summary": st.session_state.get("repo_summary"),
             "messages": st.session_state.get("messages", []),
+            "last_index_count": st.session_state.get("last_index_count"),
+            "last_index_stats": st.session_state.get("last_index_stats"),
+            "logged_in_user": st.session_state.get("logged_in_user"),
         }
-        with open(_session_file(session_id), "w", encoding="utf-8") as f:
-            json.dump(data, f)
+        sid = st.session_state.get("_session_id")
+        if sid:
+            with open(_session_file(sid), "w", encoding="utf-8") as f:
+                json.dump(data, f)
+
+        username = st.session_state.get("logged_in_user")
+        if username:
+            with open(_session_file(username), "w", encoding="utf-8") as f:
+                json.dump(data, f)
     except Exception:
         pass
 
@@ -119,7 +137,16 @@ def load_session_state(session_id: str) -> bool:
     """Restores a previously saved conversation into session_state.
     Returns True if something was actually restored, False otherwise
     (no file, corrupted file, etc. -- all handled gracefully, just starts
-    fresh in that case rather than erroring)."""
+    fresh in that case rather than erroring).
+
+    IMPORTANT CAVEAT: this restores what THIS browser session last saw, but
+    ingest.py uses a single global ChromaDB collection -- if a different
+    repo was indexed on the server since this session was saved (by you in
+    another tab, or anyone else), the restored chat/stats may no longer
+    match what's actually in the vector index. st.session_state["_restored"]
+    is set to True whenever a restore happens, so the UI can show a gentle
+    "re-index if things look off" hint rather than presenting stale data
+    as if it were freshly confirmed."""
     try:
         path = _session_file(session_id)
         if not os.path.exists(path):
@@ -131,6 +158,13 @@ def load_session_state(session_id: str) -> bool:
         if data.get("repo_summary"):
             st.session_state["repo_summary"] = data["repo_summary"]
         st.session_state["messages"] = data.get("messages", [])
+        if data.get("last_index_count") is not None:
+            st.session_state["last_index_count"] = data["last_index_count"]
+        if data.get("last_index_stats") is not None:
+            st.session_state["last_index_stats"] = data["last_index_stats"]
+        if data.get("logged_in_user"):
+            st.session_state["logged_in_user"] = data["logged_in_user"]
+        st.session_state["_restored"] = True
         return True
     except Exception:
         return False
@@ -148,6 +182,65 @@ elif "_session_id" not in st.session_state:
 # won't exist yet) but the URL has a known session ID, restore it.
 if "messages" not in st.session_state:
     load_session_state(st.session_state["_session_id"])
+    # If that revealed a logged-in user, also pull their canonical
+    # username-keyed data -- it may be newer than what this particular
+    # browser tab last saved (e.g. updated from another device).
+    if st.session_state.get("logged_in_user"):
+        load_session_state(st.session_state["logged_in_user"])
+
+# ---------------------------------------------------------------------------
+# Authentication gate: real per-user signup/login (see auth.py for details
+# and security notes). Nothing below this block runs until logged in.
+# ---------------------------------------------------------------------------
+if not st.session_state.get("logged_in_user"):
+    st.markdown("<h1 style='text-align:center;'>🧠 RepoMind</h1>", unsafe_allow_html=True)
+    st.markdown(
+        "<p style='text-align:center; color:gray;'>Sign in to start exploring codebases.</p>",
+        unsafe_allow_html=True,
+    )
+    _, _center, _ = st.columns([1, 1.2, 1])
+    with _center:
+        login_tab, signup_tab = st.tabs(["🔑 Log in", "✍️ Sign up"])
+
+        with login_tab:
+            with st.form("login_form"):
+                li_username = st.text_input("Username", key="li_username")
+                li_password = st.text_input("Password", type="password", key="li_password")
+                if st.form_submit_button("Log in", use_container_width=True, type="primary"):
+                    if not li_username or not li_password:
+                        st.error("Please enter both a username and password.")
+                    else:
+                        ok, msg = Auth.login(li_username, li_password)
+                        if ok:
+                            st.session_state["logged_in_user"] = li_username.strip()
+                            # Pull in THIS user's own previously saved repo/chat
+                            # state (if any) -- keyed by username now, not the
+                            # random browser-tab ID, so it follows their account.
+                            if not load_session_state(li_username.strip()):
+                                st.session_state["messages"] = []
+                            save_session_state()
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
+        with signup_tab:
+            with st.form("signup_form"):
+                su_username = st.text_input("Choose a username", key="su_username")
+                su_password = st.text_input("Choose a password", type="password", key="su_password")
+                su_password2 = st.text_input("Confirm password", type="password", key="su_password2")
+                if st.form_submit_button("Create account", use_container_width=True, type="primary"):
+                    if not su_username or not su_password:
+                        st.error("Please fill in all fields.")
+                    elif su_password != su_password2:
+                        st.error("Passwords don't match.")
+                    else:
+                        ok, msg = Auth.signup(su_username, su_password)
+                        if ok:
+                            st.success(msg + " Switch to the Log in tab above.")
+                        else:
+                            st.error(msg)
+    st.stop()  # nothing below this line renders until logged in
 
 # ---------------------------------------------------------------------------
 # Styling
@@ -207,9 +300,17 @@ def get_embedder():
     return SentenceTransformer("all-MiniLM-L6-v2")
 
 
+def current_collection_name() -> str:
+    """Every user's repo data lives in its own ChromaDB collection, named
+    from their username -- this is what makes 'per-user sessions' actually
+    real data isolation, not just a login screen in front of shared data."""
+    username = st.session_state.get("logged_in_user")
+    return get_user_collection_name(username) if username else COLLECTION_NAME
+
+
 def retrieve(query: str, k: int = 5):
     client = chromadb.PersistentClient(path=DB_PATH)
-    collection = client.get_collection(COLLECTION_NAME)
+    collection = client.get_collection(current_collection_name())
     embedder = get_embedder()
     query_emb = embedder.encode([query])[0].tolist()
     results = collection.query(query_embeddings=[query_emb], n_results=k)
@@ -398,7 +499,7 @@ with st.sidebar:
             groq_key_for_summary = get_groq_key()
             with st.spinner("Cloning, chunking, and embedding the repo... larger repos take longer."):
                 try:
-                    n_chunks, stats = ingest_repo(repo_url.strip())
+                    n_chunks, stats = ingest_repo(repo_url.strip(), collection_name=current_collection_name())
                     st.session_state["indexed_repo"] = repo_url.strip()
                     st.session_state["messages"] = []
                     st.session_state["last_index_count"] = n_chunks
@@ -434,6 +535,12 @@ with st.sidebar:
             f'{stats.get("total_files", "?")} files{truncated_note}<br>{file_breakdown}</div></div>',
             unsafe_allow_html=True,
         )
+        if st.session_state.get("last_index_count") is None:
+            st.caption(
+                "⚠️ This looks like a restored session with no confirmed chunk count. "
+                "The live search index may have changed since then — click **Index Repo** "
+                "again above to be sure you're querying this exact repo."
+            )
         if st.button("🗑️  Clear chat", use_container_width=True):
             st.session_state["messages"] = []
             st.rerun()
@@ -533,6 +640,22 @@ with st.sidebar:
                 use_container_width=True,
             )
             st.caption("Opens in any browser — includes both your Q&A and any diagram images together.")
+
+    st.markdown("---")
+
+    st.caption(f"👤 Logged in as **{st.session_state['logged_in_user']}**")
+    if st.button("🚪 Log out", use_container_width=True):
+        # Clear this browser tab's view completely -- the user's own saved
+        # data (under their username file) is left untouched on disk, so
+        # it's still there next time they log in from anywhere.
+        st.session_state["logged_in_user"] = None
+        st.session_state["indexed_repo"] = None
+        st.session_state["repo_summary"] = None
+        st.session_state["messages"] = []
+        st.session_state["last_index_count"] = None
+        st.session_state["last_index_stats"] = None
+        save_session_state()
+        st.rerun()
 
     st.markdown("---")
 
@@ -717,7 +840,7 @@ if question:
         with st.chat_message("assistant", avatar="🧠"):
             with st.spinner("Analyzing internal import relationships..."):
                 try:
-                    graph = build_repo_module_graph(DB_PATH, COLLECTION_NAME)
+                    graph = build_repo_module_graph(DB_PATH, current_collection_name())
                     graph, was_trimmed = trim_to_most_connected(graph, max_nodes=35)
                     mermaid_code = graph_to_mermaid(graph)
                 except Exception:

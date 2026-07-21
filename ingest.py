@@ -173,7 +173,19 @@ def collect_chunks(repo_dir: str):
     return chunks, stats
 
 
-def embed_and_store(chunks, repo_url: str):
+def get_user_collection_name(username: str) -> str:
+    """Derives a safe, per-user ChromaDB collection name so each logged-in
+    user's indexed repo and chat data are genuinely isolated from every
+    other user -- not just separated in the UI. ChromaDB collection names
+    only allow letters, digits, underscores, and hyphens, so this strips
+    anything else out defensively (auth.py already restricts usernames to
+    a safe character set at signup, but this stays defensive in case that
+    ever changes)."""
+    safe = "".join(c for c in username if c.isalnum() or c in ("_", "-"))
+    return f"{COLLECTION_NAME}_{safe}" if safe else COLLECTION_NAME
+
+
+def embed_and_store(chunks, repo_url: str, collection_name: str = COLLECTION_NAME):
     print(f"[2/4] Loading embedding model ...")
     model = SentenceTransformer("all-MiniLM-L6-v2")
 
@@ -181,14 +193,16 @@ def embed_and_store(chunks, repo_url: str):
     texts = [c["text"] for c in chunks]
     embeddings = model.encode(texts, show_progress_bar=True, batch_size=64)
 
-    print(f"[4/4] Writing to ChromaDB at {DB_PATH} ...")
+    print(f"[4/4] Writing to ChromaDB at {DB_PATH} (collection: {collection_name}) ...")
     client = chromadb.PersistentClient(path=DB_PATH)
     # Fresh collection per ingest run so old repo data doesn't mix in.
+    # Using a per-user collection_name (see get_user_collection_name) means
+    # this only clears THIS user's previous repo, never another user's data.
     try:
-        client.delete_collection(COLLECTION_NAME)
+        client.delete_collection(collection_name)
     except Exception:
         pass
-    collection = client.create_collection(COLLECTION_NAME)
+    collection = client.create_collection(collection_name)
 
     ids = [f"{c['file']}::{c['start_line']}::{i}" for i, c in enumerate(chunks)]
     metadatas = [{"file": c["file"], "start_line": c["start_line"], "repo": repo_url} for c in chunks]
@@ -202,14 +216,14 @@ def embed_and_store(chunks, repo_url: str):
     print(f"Done. Indexed {len(chunks)} chunks from {repo_url}.")
 
 
-def ingest_repo(repo_url: str):
+def ingest_repo(repo_url: str, collection_name: str = COLLECTION_NAME):
     tmp_dir = tempfile.mkdtemp()
     try:
         clone_repo(repo_url, tmp_dir)
         chunks, stats = collect_chunks(tmp_dir)
         if not chunks:
             raise ValueError("No indexable files found in this repo.")
-        embed_and_store(chunks, repo_url)
+        embed_and_store(chunks, repo_url, collection_name=collection_name)
         return len(chunks), stats
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)

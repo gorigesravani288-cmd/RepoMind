@@ -42,14 +42,20 @@ INCLUDE_FILENAMES = {"readme", "license", "contributing", "changelog", "makefile
 CHUNK_LINES = 60      # lines per chunk
 CHUNK_OVERLAP = 10    # overlapping lines between consecutive chunks
 MAX_FILE_LINES = 3000   # skip pathologically huge single files (usually generated/data)
-MAX_TOTAL_CHUNKS = 1500  # cap total chunks so free-tier CPU embedding stays fast on huge repos
+MAX_TOTAL_CHUNKS = 4000  # cap total chunks so free-tier CPU embedding stays fast on huge repos.
+                         # Combined with the priority ordering below (core source before
+                         # tests/docs/examples), this is enough headroom for the interconnected
+                         # core of most repos -- including large ones like Django -- to fit
+                         # before the cap is hit.
 DB_PATH = "./chroma_db"
 COLLECTION_NAME = "repo_chunks"
 
 
 def clone_repo(repo_url: str, dest: str) -> None:
     print(f"[1/4] Cloning {repo_url} ...")
-    git.Repo.clone_from(repo_url, dest, depth=1)
+    # single_branch avoids fetching refs for every other branch, which matters
+    # on large, long-lived repos with many branches.
+    git.Repo.clone_from(repo_url, dest, depth=1, single_branch=True)
 
 
 def chunk_python_by_ast(source_text: str):
@@ -105,24 +111,58 @@ def chunk_python_by_ast(source_text: str):
     return chunks if chunks else None
 
 
+# Folders that are useful to have SOME coverage of, but shouldn't consume
+# the chunk budget before the real, interconnected source code does on a
+# large repo. This does NOT exclude them (unlike diagram.py, which fully
+# excludes these from the architecture diagram) -- it just means they're
+# indexed LAST, so questions about tests/docs still work on repos small
+# enough to fit everything, while large repos (Django, the Linux kernel,
+# etc.) spend their limited budget on core source first.
+LOW_PRIORITY_DIRS = {
+    "tests", "test", "docs", "doc", "examples", "example",
+    ".github", "benchmarks", "benchmark", "scripts", "tools", "js_tests",
+}
+
+
+def _file_priority(rel_path: str) -> int:
+    """Returns 0 (high priority, indexed first) or 1 (low priority, indexed
+    last) based on whether any folder in the path is a known low-priority
+    directory. Checking every path segment (not just the top-level one)
+    catches cases like "django/tests/..." where the low-priority folder
+    isn't at the repo root."""
+    parts = rel_path.replace("\\", "/").split("/")
+    for part in parts[:-1]:  # exclude the filename itself
+        if part.lower() in LOW_PRIORITY_DIRS:
+            return 1
+    return 0
+
+
 def collect_chunks(repo_dir: str):
     """Walk the repo and split eligible files into overlapping line-based chunks.
     Also returns a stats dict: {"files": {ext_or_name: count}, "total_files": N,
     "truncated": bool} — truncated is True if MAX_TOTAL_CHUNKS was hit on a very
     large repo, so the app can inform the user rather than silently cutting off.
+
+    IMPORTANT: this runs in TWO PHASES rather than chunking as it walks.
+    Phase 1 collects every eligible file path across the whole repo tree.
+    Phase 2 sorts them (core source first, tests/docs/examples last via
+    _file_priority) and only THEN chunks them in that order, stopping at
+    MAX_TOTAL_CHUNKS. Without this, a single-pass walk-and-chunk approach
+    could exhaust the chunk budget on non-essential files before ever
+    reaching a large repo's actual interconnected core -- silently leaving
+    features like the architecture diagram with nothing meaningful to work
+    with, even though the repo genuinely has plenty of real internal
+    imports.
     """
-    chunks = []
     file_stats = {}
     indexed_files = set()
     truncated = False
 
+    # --- Phase 1: collect every eligible file path (no chunking yet) ---
+    eligible_files = []  # list of (rel_path, fpath, ext, name_no_ext)
     for root, dirs, files in os.walk(repo_dir):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for fname in files:
-            if len(chunks) >= MAX_TOTAL_CHUNKS:
-                truncated = True
-                break
-
             fname_lower = fname.lower()
             if fname_lower in SKIP_FILENAMES or fname_lower.endswith(SKIP_FILE_SUFFIXES):
                 continue
@@ -131,73 +171,96 @@ def collect_chunks(repo_dir: str):
             name_no_ext = os.path.splitext(fname)[0].lower()
             if ext not in INCLUDE_EXTENSIONS and name_no_ext not in INCLUDE_FILENAMES:
                 continue
+
             fpath = os.path.join(root, fname)
             rel_path = os.path.relpath(fpath, repo_dir)
-            try:
-                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                    lines = f.readlines()
-            except Exception:
-                continue
+            eligible_files.append((rel_path, fpath, ext, name_no_ext))
 
-            if len(lines) > MAX_FILE_LINES:
-                continue  # skip pathologically huge single files (usually generated/data dumps)
+    # --- Phase 2: sort so core source is chunked before low-priority dirs ---
+    eligible_files.sort(key=lambda item: (_file_priority(item[0]), item[0]))
 
-            label = ext if ext else name_no_ext
-            file_stats[label] = file_stats.get(label, 0) + 1
-            indexed_files.add(rel_path)
+    # --- Phase 3: chunk in priority order, stopping at the budget ---
+    chunks = []
+    for rel_path, fpath, ext, name_no_ext in eligible_files:
+        if len(chunks) >= MAX_TOTAL_CHUNKS:
+            truncated = True
+            break
 
-            file_text = "".join(lines)
-            file_chunks = None
-            if ext == ".py":
-                file_chunks = chunk_python_by_ast(file_text)
+        try:
+            with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+        except Exception:
+            continue
 
-            if file_chunks is not None:
-                for c in file_chunks:
-                    chunks.append({"text": c["text"], "file": rel_path, "start_line": c["start_line"]})
-            else:
-                # Line-based fallback (non-Python files, or Python with a syntax error)
-                step = CHUNK_LINES - CHUNK_OVERLAP
-                for start in range(0, len(lines), step):
-                    chunk_lines = lines[start:start + CHUNK_LINES]
-                    text = "".join(chunk_lines).strip()
-                    if not text:
-                        continue
-                    chunks.append({
+        if len(lines) > MAX_FILE_LINES:
+            continue  # skip pathologically huge single files (usually generated/data dumps)
+        if not lines:
+            continue  # skip empty files -- nothing to chunk or embed
+
+        label = ext if ext else name_no_ext
+        file_stats[label] = file_stats.get(label, 0) + 1
+        indexed_files.add(rel_path)
+
+        file_text = "".join(lines)
+        file_chunks = None
+        if ext == ".py":
+            file_chunks = chunk_python_by_ast(file_text)
+
+        if file_chunks is not None:
+            for c in file_chunks:
+                chunks.append({"text": c["text"], "file": rel_path, "start_line": c["start_line"]})
+        else:
+            # Line-based fallback (non-Python files, or Python with a syntax error)
+            step = CHUNK_LINES - CHUNK_OVERLAP
+            for start in range(0, len(lines), step):
+                chunk_lines = lines[start:start + CHUNK_LINES]
+                text = "".join(chunk_lines).strip()
+                if not text:
+                    continue
+                chunks.append({
                         "text": text,
                         "file": rel_path,
                         "start_line": start + 1,
                     })
-        if truncated:
-            break
 
     stats = {"files": file_stats, "total_files": len(indexed_files), "truncated": truncated}
     return chunks, stats
 
 
-def get_user_collection_name(username: str, repo_url: str = None) -> str:
-    """Derives a safe, per-user (and, when repo_url is given, per-repo)
-    ChromaDB collection name.
+def get_user_collection_name(username: str) -> str:
+    """Derives a safe, per-user ChromaDB collection name so each logged-in
+    user's indexed repo and chat data are genuinely isolated from every
+    other user -- not just separated in the UI. ChromaDB collection names
+    only allow letters, digits, underscores, and hyphens, so this strips
+    anything else out defensively (auth.py already restricts usernames to
+    a safe character set at signup, but this stays defensive in case that
+    ever changes)."""
+    safe = "".join(c for c in username if c.isalnum() or c in ("_", "-"))
+    return f"{COLLECTION_NAME}_{safe}" if safe else COLLECTION_NAME
 
-    Including the repo matters: without it, indexing a *second* repo under
-    the same account would call delete_collection() on the SAME collection
-    the first repo lives in (see embed_and_store below), silently wiping
-    it. Keying by (user, repo) means each repo a user has ever indexed
-    keeps its own permanent collection -- so re-opening a previously
-    indexed repo from the "recent repos" list can restore it instantly,
-    with zero re-cloning or re-embedding.
 
-    ChromaDB collection names only allow letters, digits, underscores, and
-    hyphens, so this strips anything else out defensively (auth.py already
-    restricts usernames to a safe character set at signup, but this stays
-    defensive in case that ever changes). The repo URL is hashed rather
-    than sanitized-and-concatenated, since a raw URL contains characters
-    ChromaDB rejects and can be arbitrarily long."""
-    safe_user = "".join(c for c in username if c.isalnum() or c in ("_", "-"))
-    base = f"{COLLECTION_NAME}_{safe_user}" if safe_user else COLLECTION_NAME
-    if repo_url:
-        repo_hash = hashlib.sha1(repo_url.strip().lower().encode("utf-8")).hexdigest()[:10]
-        return f"{base}_{repo_hash}"
-    return base
+def get_user_repo_collection_name(username: str, repo_url: str) -> str:
+    """Derives a collection name unique to this (user, repo) PAIR, not just
+    the user. This is what allows a user to have several previously-indexed
+    repos coexisting at once -- switching back to one they visited before
+    (e.g. clicking it in "Recent repos") can reuse its existing vector data
+    instead of re-cloning and re-embedding it from scratch every time."""
+    user_part = get_user_collection_name(username)
+    repo_hash = hashlib.md5(repo_url.strip().lower().encode("utf-8")).hexdigest()[:10]
+    return f"{user_part}_{repo_hash}"
+
+
+def collection_exists(db_path: str, collection_name: str) -> bool:
+    """Checks whether a collection already has data, without raising if it
+    doesn't -- ChromaDB's get_collection() throws an exception for a
+    missing collection rather than returning None, so this wraps that into
+    a simple boolean."""
+    try:
+        client = chromadb.PersistentClient(path=db_path)
+        client.get_collection(collection_name)
+        return True
+    except Exception:
+        return False
 
 
 def embed_and_store(chunks, repo_url: str, collection_name: str = COLLECTION_NAME):
@@ -222,12 +285,16 @@ def embed_and_store(chunks, repo_url: str, collection_name: str = COLLECTION_NAM
     ids = [f"{c['file']}::{c['start_line']}::{i}" for i, c in enumerate(chunks)]
     metadatas = [{"file": c["file"], "start_line": c["start_line"], "repo": repo_url} for c in chunks]
 
-    collection.add(
-        ids=ids,
-        embeddings=[e.tolist() for e in embeddings],
-        documents=texts,
-        metadatas=metadatas,
-    )
+    # Write in batches so ChromaDB doesn't choke on one huge payload for large repos.
+    write_batch = 500
+    for start in range(0, len(chunks), write_batch):
+        end = start + write_batch
+        collection.add(
+            ids=ids[start:end],
+            embeddings=[e.tolist() for e in embeddings[start:end]],
+            documents=texts[start:end],
+            metadatas=metadatas[start:end],
+        )
     print(f"Done. Indexed {len(chunks)} chunks from {repo_url}.")
 
 
